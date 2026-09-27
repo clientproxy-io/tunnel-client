@@ -4,7 +4,7 @@ version = "1.0.5"
 edition = "2024"
 description = "Tunnel client for clientproxy.io — expose local backends through a reverse proxy tunnel"
 homepage = "https://clientproxy.io"
-repository = "https://github.com/OliBotProxy/rust-client"
+repository = "https://github.com/clientproxy-io/tunnel-client"
 license = "MIT"
 publish = false
 

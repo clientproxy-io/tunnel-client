@@ -5,7 +5,7 @@
 # Portainer, or plain `docker compose up -d`.
 services:
   tunnel-client:
-    image: ghcr.io/olibotproxy/tunnel-client:latest
+    image: ghcr.io/clientproxy-io/tunnel-client:latest
     container_name: tunnel-client
     restart: unless-stopped
     # Host networking lets backends configured as localhost:<port> in the

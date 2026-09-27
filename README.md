@@ -45,9 +45,9 @@ Every flag can also be set through an environment variable: `TUNNEL_API_URL`, `T
 **Install:**
 
 ```bash
-VER=$(curl -s https://api.github.com/repos/OliBotProxy/rust-client/releases/latest \
+VER=$(curl -s https://api.github.com/repos/clientproxy-io/tunnel-client/releases/latest \
   | grep '"tag_name"' | cut -d'"' -f4 | sed 's/v//')
-curl -LO "https://github.com/OliBotProxy/rust-client/releases/download/v${VER}/tunnel-client_${VER}_amd64.deb"
+curl -LO "https://github.com/clientproxy-io/tunnel-client/releases/download/v${VER}/tunnel-client_${VER}_amd64.deb"
 sudo dpkg -i "tunnel-client_${VER}_amd64.deb"
 ```
 
@@ -81,9 +81,9 @@ sudo systemctl edit tunnel-client
 **Install:**
 
 ```bash
-VER=$(curl -s https://api.github.com/repos/OliBotProxy/rust-client/releases/latest \
+VER=$(curl -s https://api.github.com/repos/clientproxy-io/tunnel-client/releases/latest \
   | grep '"tag_name"' | cut -d'"' -f4 | sed 's/v//')
-curl -LO "https://github.com/OliBotProxy/rust-client/releases/download/v${VER}/tunnel-client-${VER}-1.amd64.rpm"
+curl -LO "https://github.com/clientproxy-io/tunnel-client/releases/download/v${VER}/tunnel-client-${VER}-1.amd64.rpm"
 sudo rpm -i "tunnel-client-${VER}-1.amd64.rpm"
 ```
 
@@ -101,7 +101,7 @@ sudo systemctl enable --now tunnel-client
 
 **Step 1 — Download**
 
-Download `tunnel-client-windows-<version>.zip` from [Releases](https://github.com/OliBotProxy/rust-client/releases) and extract it to a temporary folder.
+Download `tunnel-client-windows-<version>.zip` from [Releases](https://github.com/clientproxy-io/tunnel-client/releases) and extract it to a temporary folder.
 
 **Step 2 — Install**
 
@@ -159,7 +159,7 @@ One package for every model: Intel/AMD, ARMv8 and ARMv7 CPUs.
 3. Open the **Community** tab, choose **clientproxy.io Tunnel**, and click **Install**.
 4. In the wizard, pick your region and paste your **Tunnel ID** and **API key**.
 
-**Manual install:** download `tunnel-client-<version>-synology-dsm7.spk` from [Releases](https://github.com/OliBotProxy/rust-client/releases), then use **Package Center → Manual Install**.
+**Manual install:** download `tunnel-client-<version>-synology-dsm7.spk` from [Releases](https://github.com/clientproxy-io/tunnel-client/releases), then use **Package Center → Manual Install**.
 
 Either way, the package starts right after install and on every boot.
 
@@ -173,21 +173,21 @@ In the dashboard, point your domains at services on the NAS, for example `localh
 
 ### Docker (QNAP, TrueNAS SCALE, Unraid, OpenMediaVault, CasaOS, Synology Container Manager)
 
-Multi-arch image (`amd64`, `arm64`, `arm/v7`): `ghcr.io/olibotproxy/tunnel-client`
+Multi-arch image (`amd64`, `arm64`, `arm/v7`): `ghcr.io/clientproxy-io/tunnel-client`
 
 ```bash
 docker run -d --name tunnel-client --restart unless-stopped --network host \
   -e TUNNEL_API_URL=https://api-us.clientproxy.io/api \
   -e TUNNEL_ID=<YOUR_TUNNEL_ID> \
   -e TUNNEL_API_KEY=<YOUR_API_KEY> \
-  ghcr.io/olibotproxy/tunnel-client:latest
+  ghcr.io/clientproxy-io/tunnel-client:latest
 ```
 
 Or use [docker/docker-compose.yml](docker/docker-compose.yml) with any compose UI (Container Manager *Project*, Container Station *Application*, OMV compose plugin, Portainer stack).
 
 `--network host` lets dashboard backends like `localhost:8080` reach services on the host. With bridge networking, use the host's LAN IP or another container's name in the dashboard instead.
 
-**Unraid:** Docker → Add Container. Set Repository to `ghcr.io/olibotproxy/tunnel-client:latest` and Network Type to **Host**, then add the variables `TUNNEL_API_URL`, `TUNNEL_ID` and `TUNNEL_API_KEY`. A Community Applications template is in [packaging/unraid/tunnel-client.xml](packaging/unraid/tunnel-client.xml).
+**Unraid:** Docker → Add Container. Set Repository to `ghcr.io/clientproxy-io/tunnel-client:latest` and Network Type to **Host**, then add the variables `TUNNEL_API_URL`, `TUNNEL_ID` and `TUNNEL_API_KEY`. A Community Applications template is in [packaging/unraid/tunnel-client.xml](packaging/unraid/tunnel-client.xml).
 
 **Build the image yourself:** `docker build -t tunnel-client .`
 

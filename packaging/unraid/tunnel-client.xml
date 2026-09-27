@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>tunnel-client</Name>
-  <Repository>ghcr.io/olibotproxy/tunnel-client:latest</Repository>
-  <Registry>https://github.com/OliBotProxy/rust-client/pkgs/container/tunnel-client</Registry>
+  <Repository>ghcr.io/clientproxy-io/tunnel-client:latest</Repository>
+  <Registry>https://github.com/clientproxy-io/tunnel-client/pkgs/container/tunnel-client</Registry>
   <Network>host</Network>
   <Privileged>false</Privileged>
   <Support>https://clientproxy.io/docs</Support>
@@ -10,8 +10,8 @@
   <Overview>Expose web apps running on your server to the internet through a secure clientproxy.io reverse-proxy tunnel. No port forwarding, no public IP, automatic HTTPS. Map domains to backends such as localhost:8096 in the clientproxy.io dashboard.</Overview>
   <Category>Network:Proxy Network:Other</Category>
   <WebUI/>
-  <TemplateURL>https://raw.githubusercontent.com/OliBotProxy/rust-client/main/packaging/unraid/tunnel-client.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/OliBotProxy/rust-client/main/packaging/synology/PACKAGE_ICON_256.PNG</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/clientproxy-io/tunnel-client/main/packaging/unraid/tunnel-client.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/clientproxy-io/tunnel-client/main/packaging/synology/PACKAGE_ICON_256.PNG</Icon>
   <Config Name="API URL (region)" Target="TUNNEL_API_URL" Default="https://api-us.clientproxy.io/api|https://api-eu.clientproxy.io/api|https://api-asia.clientproxy.io/api" Mode="" Description="Region your tunnel was created in" Type="Variable" Display="always" Required="true" Mask="false">https://api-us.clientproxy.io/api</Config>
   <Config Name="Tunnel ID" Target="TUNNEL_ID" Default="" Mode="" Description="From the clientproxy.io dashboard" Type="Variable" Display="always" Required="true" Mask="false"/>
   <Config Name="API key" Target="TUNNEL_API_KEY" Default="" Mode="" Description="&lt;subscriptionId&gt;_&lt;key&gt; from the clientproxy.io dashboard" Type="Variable" Display="always" Required="true" Mask="true"/>

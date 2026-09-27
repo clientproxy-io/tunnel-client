@@ -231,7 +231,7 @@ jobs:
       contents: read
       packages: write
     env:
-      IMAGE: ghcr.io/olibotproxy/tunnel-client
+      IMAGE: ghcr.io/clientproxy-io/tunnel-client
     steps:
       - uses: actions/checkout@v4
 
