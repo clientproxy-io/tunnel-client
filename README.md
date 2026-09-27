@@ -150,24 +150,65 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1
 
 ### Synology DiskStation (DSM 7)
 
-One package for every model: Intel/AMD, ARMv8 and ARMv7 CPUs.
+One package for every model: Intel/AMD, ARMv8 and ARMv7 CPUs. The package runs tunnel-client on the NAS itself, so every domain mapping points at a port on the NAS.
+
+#### 1. Create the client tunnel
+
+Do this in the [clientproxy.io dashboard](https://www.clientproxy.io):
+
+1. **Client Tunnels → Create Tunnel**. Enter a description (e.g. `Synology`) and choose a proxy server.
+2. On the new tunnel, click **Assign Product** and pick a plan. During the beta, the free and demo plans are available.
+3. Copy the **Tunnel ID** from the tunnel's detail view, and the **API key** from **Dashboard → API Key**.
+
+#### 2. Install the package
 
 **From Package Center (recommended — you get updates automatically):**
 
 1. **Package Center → Settings → General → Trust Level** → *Any publisher*.
 2. **Package Sources → Add**: name `clientproxy.io`, location `https://api-us.clientproxy.io/api/synology`.
 3. Open the **Community** tab, choose **clientproxy.io Tunnel**, and click **Install**.
-4. In the wizard, pick your region and paste your **Tunnel ID** and **API key**.
+4. In the wizard, pick your region and paste the **Tunnel ID** and **API key** from step 1.
 
 **Manual install:** download `tunnel-client-<version>-synology-dsm7.spk` from [Releases](https://github.com/clientproxy-io/tunnel-client/releases), then use **Package Center → Manual Install**.
 
 Either way, the package starts right after install and on every boot.
 
-In the dashboard, point your domains at services on the NAS, for example `localhost:5000` (DSM) or `localhost:8096` (Jellyfin).
+#### 3. Map domains to NAS services
+
+In the dashboard, open **Client Tunnels**, click **Domains** on the tunnel's row, then **Add Domain**. In the *Add Domain Mapping* dialog:
+
+- **Domain**: tick *Auto-generate default domain* for a free `<id>.<proxy>.clientproxy.io` address, or enter your own domain.
+- **Local IP:port**: the service's **plain HTTP** port on the NAS.
+
+| What you want to publish | Local IP:port | Notes |
+|---|---|---|
+| DSM web interface | `localhost:5000` | DSM's HTTP port. **Not 5001**, which is HTTPS only. |
+| Website from Web Station | `localhost:80` | Or the HTTP port of your Web Station portal. |
+| A DSM app on its own port (e.g. Synology Photos) | `localhost:<HTTP port>` | Control Panel → Login Portal → Applications → edit the app → set an **HTTP** port. |
+| Container (Container Manager) | `localhost:<host port>` | e.g. `localhost:8096` (Jellyfin), `localhost:8123` (Home Assistant). |
+
+Always map an HTTP port. tunnel-client talks plain HTTP to the NAS, and the proxy's Let's Encrypt certificate already gives visitors HTTPS. The NAS LAN IP (e.g. `192.168.0.79:5000`) works too, but `localhost` keeps working if the NAS gets a new IP.
+
+Mapping changes reach the running package within 5 minutes. To apply them immediately, Stop and Run the package in Package Center.
+
+#### 4. Check DSM settings
+
+- **Control Panel → Login Portal → DSM → "Automatically redirect HTTP connection to HTTPS"** must be **off**. Otherwise visitors are redirected to port 5001 and get a *too many redirects* error.
+- Turn on **2-factor authentication** (Personal → Security) for accounts that log in through the tunnel. The DSM login page is now reachable from the internet.
+- **Auto Block** (Control Panel → Security → Protection) sees all tunnel traffic coming from the NAS itself. If it blocks that address after failed logins, the whole tunnel is locked out, so rely on 2-factor authentication instead.
+
+#### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `400 The plain HTTP request was sent to HTTPS port` | You mapped an HTTPS port (usually 5001). Change it to the HTTP port (5000). |
+| *Too many redirects* | Turn off DSM's HTTP → HTTPS redirect (see step 4). |
+| Page does not load | Check the package is running and open **View log**. After connecting, each mapping appears as `domain_id=… → localhost:5000`. |
+| Old mapping still used | Wait up to 5 minutes, or Stop and Run the package. |
 
 **Change settings:** installing a newer `.spk` over the old one opens an upgrade wizard where you can switch region, Tunnel ID or API key. Fields left blank keep their current values. Between releases, edit `/var/packages/tunnel-client/var/env` over SSH and restart the package.
 
-**Logs:** Package Center → tunnel-client → **View log**, or `/var/packages/tunnel-client/var/tunnel-client.log`.
+**Logs:** Package Center → clientproxy.io Tunnel → **View log**, or `/var/packages/tunnel-client/var/tunnel-client.log`.
 
 ---
 
