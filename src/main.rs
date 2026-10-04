@@ -61,11 +61,19 @@ mod flags {
   pub const HAS_BODY: u8        = 0x01;
   pub const END_STREAM: u8      = 0x01;
   pub const RESPONSE_HAS_BODY: u8 = 0x01;
+  /// REQUEST: HTTP/1.1 Upgrade handshake (WebSocket) — keep Upgrade/Connection headers.
+  pub const UPGRADE: u8         = 0x04;
+  /// RESPONSE: backend answered 101; DATA frames now carry raw bytes both ways.
+  pub const RESPONSE_UPGRADED: u8 = 0x02;
 }
 
 mod caps {
   pub const HTTP2_BACKENDS: u8 = 0x01;
+  /// This client can relay WebSocket (HTTP/1.1 Upgrade) streams.
+  pub const UPGRADE: u8 = 0x04;
 }
+
+type BodySenders = Arc<Mutex<HashMap<u32, mpsc::Sender<Option<Bytes>>>>>;
 
 mod reset_codes {
   pub const BACKEND_UNREACHABLE: u16 = 0x01;
@@ -117,7 +125,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> std::io
 fn build_connect_payload(tunnel_id: &str, api_key: &str) -> Bytes {
   let mut buf = BytesMut::new();
   buf.put_u8(0x02); // protocol version 2
-  buf.put_u8(caps::HTTP2_BACKENDS);
+  buf.put_u8(caps::HTTP2_BACKENDS | caps::UPGRADE);
   buf.put_u16(tunnel_id.len() as u16);
   buf.extend_from_slice(tunnel_id.as_bytes());
   buf.put_u16(api_key.len() as u16);
@@ -157,6 +165,8 @@ struct RequestPayload {
   method: String,
   path: String,
   headers: Vec<(String, String)>,
+  /// Set by the caller from the REQUEST frame's UPGRADE flag.
+  upgrade: bool,
 }
 
 fn parse_config(payload: &[u8]) -> Option<ConfigPayload> {
@@ -182,7 +192,7 @@ fn parse_request(payload: &[u8]) -> Option<RequestPayload> {
   let method  = read_u8_str(payload, &mut pos)?;
   let path    = read_u16_str(payload, &mut pos)?;
   let headers = read_headers(payload, &mut pos)?;
-  Some(RequestPayload { domain_id, method, path, headers })
+  Some(RequestPayload { domain_id, method, path, headers, upgrade: false })
 }
 
 fn read_u8_str(p: &[u8], pos: &mut usize) -> Option<String> {
@@ -550,10 +560,12 @@ where
 
     match frame.frame_type {
       FrameType::Request => {
-        let req = match parse_request(&frame.payload) {
+        let mut req = match parse_request(&frame.payload) {
           Some(r) => r,
           None => { warn!("Bad REQUEST payload on stream {}", frame.stream_id); continue; }
         };
+        req.upgrade = frame.has_flag(flags::UPGRADE)
+          && req.headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("upgrade"));
 
         let stream_id  = frame.stream_id;
         let has_body   = frame.has_flag(flags::HAS_BODY);
@@ -654,7 +666,7 @@ async fn handle_stream(
   debug!("stream {} → {} {} {}", stream_id, req.method, req.path, backend);
 
   // Make HTTP/1.1 request to local backend
-  let result = forward_to_backend(stream_id, &req, body, &backend, &writer).await;
+  let result = forward_to_backend(stream_id, &req, body, &backend, &writer, &body_senders).await;
   if let Err(e) = result {
     warn!("stream {} backend error: {}", stream_id, e);
     body_senders.lock().await.remove(&stream_id);
@@ -668,6 +680,7 @@ async fn forward_to_backend(
   body: Option<Bytes>,
   backend: &str,
   writer: &Arc<Mutex<impl AsyncWrite + Unpin + Send>>,
+  body_senders: &BodySenders,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   let mut stream = TcpStream::connect(backend).await
     .map_err(|e| format!("Backend connect failed ({}): {}", backend, e))?;
@@ -678,10 +691,17 @@ async fn forward_to_backend(
   req_bytes.extend_from_slice(format!("{} {} HTTP/1.1\r\n", req.method, req.path).as_bytes());
   for (name, value) in &req.headers {
     let lower = name.to_ascii_lowercase();
-    if lower == "connection" || lower == "keep-alive" { continue; } // override below
+    // `expect`: the whole body is sent up front, so there is nothing to wait for (and an
+    // interim `100 Continue` from the backend would otherwise be mistaken for the response).
+    if lower == "connection" || lower == "keep-alive" || lower == "expect" { continue; } // connection overridden below
     req_bytes.extend_from_slice(format!("{}: {}\r\n", name, value).as_bytes());
   }
-  req_bytes.extend_from_slice(b"connection: close\r\n");
+  if req.upgrade {
+    // WebSocket handshake: the backend must see the upgrade and keep the socket open.
+    req_bytes.extend_from_slice(b"connection: Upgrade\r\n");
+  } else {
+    req_bytes.extend_from_slice(b"connection: close\r\n");
+  }
   if let Some(ref b) = body {
     let has_cl = req.headers.iter().any(|(n, _)| n.to_ascii_lowercase() == "content-length");
     if !has_cl {
@@ -694,16 +714,23 @@ async fn forward_to_backend(
   stream.write_all(&req_bytes).await?;
   stream.flush().await?;
 
-  // Read response headers
+  // Read response headers, skipping interim 1xx responses (100 Continue, 103 Early Hints):
+  // only the final response is relayed. A 101 is final when an upgrade was requested.
   let mut resp_buf = Vec::new();
-  let mut tmp = [0u8; 4096];
+  let mut tmp = vec![0u8; 32 * 1024];
   let header_end = loop {
-    let n = stream.read(&mut tmp).await?;
-    if n == 0 { break resp_buf.len(); }
-    resp_buf.extend_from_slice(&tmp[..n]);
-    if let Some(pos) = resp_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-      break pos + 4;
-    }
+    let header_end = loop {
+      if let Some(pos) = resp_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        break pos + 4;
+      }
+      let n = stream.read(&mut tmp).await?;
+      if n == 0 { break resp_buf.len(); }
+      resp_buf.extend_from_slice(&tmp[..n]);
+    };
+    let interim = status_of(&resp_buf[..header_end])
+      .is_some_and(|c| (100..200).contains(&c) && !(c == 101 && req.upgrade));
+    if !interim { break header_end; }
+    resp_buf.drain(..header_end);
   };
 
   if header_end == 0 || resp_buf.is_empty() {
@@ -735,6 +762,37 @@ async fn forward_to_backend(
     }
   }
 
+  // Backend accepted the WebSocket upgrade: from here on the stream is a raw byte pipe.
+  if req.upgrade && status_code == 101 {
+    let leftover = resp_buf[header_end..].to_vec();
+    let (tx, rx) = mpsc::channel::<Option<Bytes>>(64);
+    body_senders.lock().await.insert(stream_id, tx);
+
+    let resp_frame = Frame {
+      frame_type: FrameType::Response,
+      stream_id,
+      flags: flags::RESPONSE_UPGRADED,
+      payload: build_response_payload(status_code, &resp_headers),
+    };
+    let sent = {
+      let mut w = writer.lock().await;
+      match write_frame(&mut *w, &resp_frame).await {
+        Ok(()) => w.flush().await,
+        Err(e) => Err(e),
+      }
+    };
+    if let Err(e) = sent {
+      body_senders.lock().await.remove(&stream_id);
+      return Err(e.into());
+    }
+
+    debug!("stream {} upgraded: {} {}", stream_id, req.path, backend);
+    relay_upgraded(stream_id, stream, leftover, rx, writer).await;
+    body_senders.lock().await.remove(&stream_id);
+    debug!("stream {} upgrade closed", stream_id);
+    return Ok(());
+  }
+
   // Status codes that carry no body per RFC 7230 §3.3
   let no_body = (100..200).contains(&status_code) || status_code == 204 || status_code == 304
     || req.method.eq_ignore_ascii_case("HEAD");
@@ -746,18 +804,26 @@ async fn forward_to_backend(
     if let Some(cl) = content_length {
       while body_buf.len() < cl {
         let n = stream.read(&mut tmp).await?;
-        if n == 0 { break; }
+        if n == 0 {
+          // Don't pass a short body off as complete: the browser would cache a corrupt file.
+          return Err(format!("Backend closed after {} of {} body bytes", body_buf.len(), cl).into());
+        }
         body_buf.extend_from_slice(&tmp[..n]);
       }
       body_buf.truncate(cl);
     } else if is_chunked {
       loop {
+        match decode_chunked(&body_buf) {
+          Chunked::Complete(decoded) => { body_buf = decoded; break; }
+          Chunked::Invalid => return Err("Backend sent invalid chunked encoding".into()),
+          Chunked::Incomplete => {}
+        }
         let n = stream.read(&mut tmp).await?;
-        if n == 0 { break; }
+        if n == 0 {
+          return Err("Backend closed in the middle of a chunked response".into());
+        }
         body_buf.extend_from_slice(&tmp[..n]);
-        if body_buf.windows(5).any(|w| w == b"0\r\n\r\n") { break; }
       }
-      body_buf = dechunk(&body_buf);
     } else {
       // No Content-Length, not chunked — read until EOF (Connection: close ensures this)
       // Use a short deadline to avoid hanging on responses that never close
@@ -771,13 +837,14 @@ async fn forward_to_backend(
       };
       let _ = tokio::time::timeout(std::time::Duration::from_secs(10), read_fut).await;
     }
-  }
 
-  // Update Content-Length header to match actual body
-  if let Some(pos) = resp_headers.iter().position(|(n, _)| n.to_ascii_lowercase() == "content-length") {
-    resp_headers[pos].1 = body_buf.len().to_string();
-  } else {
-    resp_headers.push(("content-length".to_string(), body_buf.len().to_string()));
+    // Content-Length must describe the body we relay (chunked framing was removed above).
+    // Responses without a body (HEAD, 204, 304, 1xx) keep the backend's headers untouched.
+    if let Some(pos) = resp_headers.iter().position(|(n, _)| n.to_ascii_lowercase() == "content-length") {
+      resp_headers[pos].1 = body_buf.len().to_string();
+    } else {
+      resp_headers.push(("content-length".to_string(), body_buf.len().to_string()));
+    }
   }
 
   // Send RESPONSE frame
@@ -812,6 +879,90 @@ async fn forward_to_backend(
   Ok(())
 }
 
+/// Send one DATA frame; false if the tunnel is gone.
+async fn send_data(
+  writer: &Arc<Mutex<impl AsyncWrite + Unpin + Send>>,
+  stream_id: u32,
+  flags: u8,
+  payload: Bytes,
+) -> bool {
+  let frame = Frame { frame_type: FrameType::Data, stream_id, flags, payload };
+  let mut w = writer.lock().await;
+  write_frame(&mut *w, &frame).await.is_ok() && w.flush().await.is_ok()
+}
+
+enum TunnelEnd {
+  /// Server sent END_STREAM: the browser half-closed.
+  HalfClosed,
+  /// Server sent RESET (or the session ended).
+  Aborted,
+}
+
+/// Pump bytes between the backend socket and the tunnel for an upgraded (WebSocket) stream.
+async fn relay_upgraded(
+  stream_id: u32,
+  stream: TcpStream,
+  leftover: Vec<u8>,
+  mut body_rx: mpsc::Receiver<Option<Bytes>>,
+  writer: &Arc<Mutex<impl AsyncWrite + Unpin + Send>>,
+) {
+  /// After one side closes, how long the other gets to finish its close handshake.
+  const HALF_CLOSE_GRACE: Duration = Duration::from_secs(5);
+  let (mut rd, mut wr) = stream.into_split();
+
+  // backend → tunnel
+  let up = async {
+    // Bytes the backend sent right behind its 101 headers.
+    if !leftover.is_empty() && !send_data(writer, stream_id, 0, Bytes::from(leftover)).await {
+      return;
+    }
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+      match rd.read(&mut buf).await {
+        Ok(0) | Err(_) => {
+          send_data(writer, stream_id, flags::END_STREAM, Bytes::new()).await;
+          break;
+        }
+        Ok(n) => {
+          if !send_data(writer, stream_id, 0, Bytes::copy_from_slice(&buf[..n])).await { break; }
+        }
+      }
+    }
+  };
+
+  // tunnel → backend
+  let down = async {
+    loop {
+      match body_rx.recv().await {
+        Some(Some(chunk)) => {
+          if wr.write_all(&chunk).await.is_err() || wr.flush().await.is_err() {
+            return TunnelEnd::Aborted;
+          }
+        }
+        Some(None) => {
+          let _ = wr.shutdown().await;
+          return TunnelEnd::HalfClosed;
+        }
+        None => return TunnelEnd::Aborted,
+      }
+    }
+  };
+
+  tokio::pin!(up, down);
+  tokio::select! {
+    end = &mut down => {
+      if let TunnelEnd::HalfClosed = end {
+        // Browser is gone; let the backend finish and close its side.
+        let _ = tokio::time::timeout(HALF_CLOSE_GRACE, &mut up).await;
+      }
+    }
+    _ = &mut up => {
+      // Backend closed; give the server a moment to deliver any trailing bytes.
+      let _ = tokio::time::timeout(HALF_CLOSE_GRACE, &mut down).await;
+    }
+  }
+}
+
 async fn send_reset(writer: &Arc<Mutex<impl AsyncWrite + Unpin + Send>>, stream_id: u32, error_code: u16) {
   let mut payload = BytesMut::new();
   payload.put_u16(error_code);
@@ -821,25 +972,59 @@ async fn send_reset(writer: &Arc<Mutex<impl AsyncWrite + Unpin + Send>>, stream_
   let _ = w.flush().await;
 }
 
+// ─── Response parsing helpers ─────────────────────────────────────────────────
+
+/// Status code from the first line of a response head.
+fn status_of(head: &[u8]) -> Option<u16> {
+  std::str::from_utf8(head).ok()?.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+}
+
 // ─── Chunked transfer decoding ────────────────────────────────────────────────
 
-fn dechunk(data: &[u8]) -> Vec<u8> {
-  let mut result = Vec::new();
-  let mut pos = 0;
-  while pos < data.len() {
-    let line_end = match data[pos..].windows(2).position(|w| w == b"\r\n") {
-      Some(p) => pos + p,
-      None => break,
+enum Chunked {
+  /// Terminating chunk (and trailers) seen: the de-chunked body.
+  Complete(Vec<u8>),
+  /// More bytes are needed.
+  Incomplete,
+  /// Not valid chunked framing.
+  Invalid,
+}
+
+fn find_crlf(data: &[u8]) -> Option<usize> {
+  data.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Decode a chunked body from its start. Completeness is decided by walking the chunk
+/// sizes, never by searching the payload, so chunk data may contain any bytes
+/// (including `0\r\n\r\n`). Chunk extensions are ignored; trailers are consumed.
+fn decode_chunked(data: &[u8]) -> Chunked {
+  let mut pos = 0usize;
+  let mut ranges: Vec<(usize, usize)> = Vec::new();
+  loop {
+    let Some(rel) = find_crlf(&data[pos..]) else { return Chunked::Incomplete };
+    let Ok(line) = std::str::from_utf8(&data[pos..pos + rel]) else { return Chunked::Invalid };
+    let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16) else {
+      return Chunked::Invalid;
     };
-    let size_str = std::str::from_utf8(&data[pos..line_end]).unwrap_or("0");
-    let chunk_size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
-    if chunk_size == 0 { break; }
-    pos = line_end + 2;
-    if pos + chunk_size > data.len() { break; }
-    result.extend_from_slice(&data[pos..pos + chunk_size]);
-    pos += chunk_size + 2; // skip trailing CRLF
+    pos += rel + 2;
+    if size == 0 {
+      // Trailer section: header lines until an empty line.
+      loop {
+        let Some(rel) = find_crlf(&data[pos..]) else { return Chunked::Incomplete };
+        pos += rel + 2;
+        if rel == 0 { break; }
+      }
+      break;
+    }
+    let Some(end) = pos.checked_add(size) else { return Chunked::Invalid };
+    if end + 2 > data.len() { return Chunked::Incomplete; }
+    if &data[end..end + 2] != b"\r\n" { return Chunked::Invalid; }
+    ranges.push((pos, end));
+    pos = end + 2;
   }
-  result
+  let mut out = Vec::with_capacity(ranges.iter().map(|(a, b)| b - a).sum());
+  for (a, b) in ranges { out.extend_from_slice(&data[a..b]); }
+  Chunked::Complete(out)
 }
 
 #[cfg(test)]
@@ -862,5 +1047,304 @@ mod backoff_tests {
   fn base_above_cap_is_respected() {
     let base = Duration::from_secs(120);
     assert_eq!(next_backoff(base, base), base);
+  }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+  use super::*;
+  use tokio::net::TcpListener;
+
+  /// Read an HTTP request head from `sock`, returning it lower-cased.
+  async fn read_head(sock: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+      let n = sock.read(&mut tmp).await.unwrap();
+      assert!(n > 0, "backend peer closed before sending a full request");
+      buf.extend_from_slice(&tmp[..n]);
+    }
+    String::from_utf8(buf).unwrap().to_ascii_lowercase()
+  }
+
+  fn request(upgrade: bool) -> RequestPayload {
+    let mut headers = vec![("host".to_string(), "x.example".to_string())];
+    if upgrade {
+      headers.push(("upgrade".to_string(), "websocket".to_string()));
+      headers.push(("connection".to_string(), "Upgrade".to_string()));
+      headers.push(("sec-websocket-key".to_string(), "dGhlIHNhbXBsZSBub25jZQ==".to_string()));
+    }
+    RequestPayload { domain_id: 1, method: "GET".into(), path: "/ws".into(), headers, upgrade }
+  }
+
+  #[tokio::test]
+  async fn websocket_upgrade_becomes_a_raw_pipe() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+
+    // Echo backend that also sends a byte string right behind its 101 headers.
+    tokio::spawn(async move {
+      let (mut sock, _) = listener.accept().await.unwrap();
+      let head = read_head(&mut sock).await;
+      assert!(head.contains("upgrade: websocket"), "Upgrade header must reach the backend: {head}");
+      assert!(head.contains("connection: upgrade"), "backend must see Connection: Upgrade: {head}");
+      assert!(!head.contains("connection: close"), "must not force close on an upgrade: {head}");
+      sock.write_all(
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: abc\r\n\r\nearly",
+      ).await.unwrap();
+      let mut buf = [0u8; 4096];
+      loop {
+        let n = sock.read(&mut buf).await.unwrap();
+        if n == 0 { break; }
+        sock.write_all(&buf[..n]).await.unwrap();
+      }
+      // dropping `sock` closes the connection once the client half-closes
+    });
+
+    let (client_w, mut server_r) = tokio::io::duplex(1 << 20);
+    let writer = Arc::new(Mutex::new(client_w));
+    let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
+    let (w, s) = (writer.clone(), senders.clone());
+    let task = tokio::spawn(async move { forward_to_backend(9, &request(true), None, &addr, &w, &s).await });
+
+    let resp = read_frame(&mut server_r).await.unwrap();
+    assert_eq!(resp.frame_type, FrameType::Response);
+    assert!(resp.has_flag(flags::RESPONSE_UPGRADED));
+    assert!(!resp.has_flag(flags::RESPONSE_HAS_BODY));
+    assert_eq!(u16::from_be_bytes([resp.payload[0], resp.payload[1]]), 101);
+    assert!(String::from_utf8_lossy(&resp.payload).contains("Sec-WebSocket-Accept"));
+
+    let early = read_frame(&mut server_r).await.unwrap();
+    assert_eq!((early.frame_type, &early.payload[..]), (FrameType::Data, &b"early"[..]));
+
+    // server → backend → echoed back to the server
+    let tx = senders.lock().await.get(&9).cloned().expect("upgraded stream must be registered");
+    tx.send(Some(Bytes::from_static(b"ping"))).await.unwrap();
+    let echo = read_frame(&mut server_r).await.unwrap();
+    assert_eq!((echo.frame_type, &echo.payload[..]), (FrameType::Data, &b"ping"[..]));
+    assert!(!echo.has_flag(flags::END_STREAM));
+
+    // browser half-close → backend sees EOF and closes → END_STREAM comes back
+    tx.send(None).await.unwrap();
+    let end = read_frame(&mut server_r).await.unwrap();
+    assert_eq!(end.frame_type, FrameType::Data);
+    assert!(end.has_flag(flags::END_STREAM));
+
+    task.await.unwrap().unwrap();
+    assert!(senders.lock().await.is_empty(), "stream must be forgotten after the relay ends");
+  }
+
+  #[tokio::test]
+  async fn declined_upgrade_is_an_ordinary_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+      let (mut sock, _) = listener.accept().await.unwrap();
+      read_head(&mut sock).await;
+      sock.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\n\r\nbad").await.unwrap();
+    });
+
+    let (client_w, mut server_r) = tokio::io::duplex(1 << 20);
+    let writer = Arc::new(Mutex::new(client_w));
+    let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
+    forward_to_backend(3, &request(true), None, &addr, &writer, &senders).await.unwrap();
+
+    let resp = read_frame(&mut server_r).await.unwrap();
+    assert_eq!(resp.frame_type, FrameType::Response);
+    assert!(!resp.has_flag(flags::RESPONSE_UPGRADED));
+    assert!(resp.has_flag(flags::RESPONSE_HAS_BODY));
+    assert_eq!(u16::from_be_bytes([resp.payload[0], resp.payload[1]]), 400);
+    let body = read_frame(&mut server_r).await.unwrap();
+    assert_eq!(&body.payload[..], b"bad");
+  }
+
+  #[tokio::test]
+  async fn plain_requests_still_force_connection_close() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let backend = tokio::spawn(async move {
+      let (mut sock, _) = listener.accept().await.unwrap();
+      let head = read_head(&mut sock).await;
+      sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
+      head
+    });
+
+    let (client_w, mut server_r) = tokio::io::duplex(1 << 20);
+    let writer = Arc::new(Mutex::new(client_w));
+    let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
+    forward_to_backend(4, &request(false), None, &addr, &writer, &senders).await.unwrap();
+
+    let head = backend.await.unwrap();
+    assert!(head.contains("connection: close"));
+    let resp = read_frame(&mut server_r).await.unwrap();
+    assert!(!resp.has_flag(flags::RESPONSE_UPGRADED));
+  }
+}
+
+#[cfg(test)]
+mod http_semantics_tests {
+  use super::*;
+  use tokio::net::TcpListener;
+
+  fn complete(data: &[u8]) -> Vec<u8> {
+    match decode_chunked(data) { Chunked::Complete(d) => d, Chunked::Incomplete => panic!("incomplete"), Chunked::Invalid => panic!("invalid") }
+  }
+
+  #[test]
+  fn chunked_data_may_contain_the_terminator_sequence() {
+    // "0\r\n\r\n" inside chunk data used to be taken for the end of the body.
+    let body = b"a=10\r\n\r\nrest";
+    let mut wire = format!("{:x}\r\n", body.len()).into_bytes();
+    wire.extend_from_slice(body);
+    wire.extend_from_slice(b"\r\n3\r\nend\r\n0\r\n\r\n");
+    assert_eq!(complete(&wire), b"a=10\r\n\r\nrestend");
+    // …and a prefix that stops after that data is merely incomplete.
+    assert!(matches!(decode_chunked(&wire[..wire.len() - 8]), Chunked::Incomplete));
+  }
+
+  #[test]
+  fn chunked_extensions_and_trailers_are_consumed() {
+    assert_eq!(complete(b"5;ext=1\r\nhello\r\n0\r\nX-Trailer: v\r\n\r\n"), b"hello");
+    assert!(matches!(decode_chunked(b"5\r\nhello\r\n0\r\nX-Trailer: v\r\n"), Chunked::Incomplete));
+    assert!(matches!(decode_chunked(b""), Chunked::Incomplete));
+    assert!(matches!(decode_chunked(b"zz\r\nhello\r\n"), Chunked::Invalid));
+    assert!(matches!(decode_chunked(b"5\r\nhelloXX0\r\n\r\n"), Chunked::Invalid));
+  }
+
+  /// Backend that replies with `reply` to the first request, then closes (or `then` runs).
+  async fn backend_with(reply: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+      let (mut sock, _) = listener.accept().await.unwrap();
+      let mut buf = [0u8; 4096];
+      let _ = sock.read(&mut buf).await; // request head (+ small body)
+      sock.write_all(&reply).await.unwrap();
+    });
+    addr
+  }
+
+  fn req(method: &str) -> RequestPayload {
+    RequestPayload { domain_id: 1, method: method.into(), path: "/".into(),
+      headers: vec![("host".into(), "x.example".into())], upgrade: false }
+  }
+
+  /// Run forward_to_backend and return (result, frames written to the tunnel).
+  async fn run(method: &str, addr: &str) -> (Result<(), String>, Vec<Frame>) {
+    let (client_w, mut server_r) = tokio::io::duplex(1 << 20);
+    let writer = Arc::new(Mutex::new(client_w));
+    let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
+    let result = forward_to_backend(1, &req(method), None, addr, &writer, &senders).await.map_err(|e| e.to_string());
+    drop(writer); // close our end so the reads below end at EOF
+    let mut frames = Vec::new();
+    while let Ok(f) = read_frame(&mut server_r).await { frames.push(f); }
+    (result, frames)
+  }
+
+  fn response_of(frame: &Frame) -> (u16, Vec<(String, String)>) {
+    let status = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+    let mut pos = 2;
+    (status, read_headers(&frame.payload, &mut pos).unwrap())
+  }
+
+  fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    h.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+  }
+
+  #[tokio::test]
+  async fn short_body_is_an_error_not_a_complete_response() {
+    let addr = backend_with(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nonly-some".to_vec()).await;
+    let (result, frames) = run("GET", &addr).await;
+    assert!(result.is_err(), "must fail so the stream is reset, got {result:?}");
+    assert!(frames.is_empty(), "no RESPONSE may be sent for a truncated body");
+  }
+
+  #[tokio::test]
+  async fn cut_off_chunked_stream_is_an_error() {
+    let addr = backend_with(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n".to_vec()).await;
+    let (result, frames) = run("GET", &addr).await;
+    assert!(result.is_err());
+    assert!(frames.is_empty());
+  }
+
+  #[tokio::test]
+  async fn head_keeps_the_backend_content_length() {
+    let addr = backend_with(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n".to_vec()).await;
+    let (result, frames) = run("HEAD", &addr).await;
+    result.unwrap();
+    let (status, headers) = response_of(&frames[0]);
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "content-length"), Some("1234"));
+    assert!(!frames[0].has_flag(flags::RESPONSE_HAS_BODY));
+  }
+
+  #[tokio::test]
+  async fn no_content_and_not_modified_get_no_synthetic_length() {
+    let addr = backend_with(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()).await;
+    let (_, frames) = run("GET", &addr).await;
+    assert_eq!(header(&response_of(&frames[0]).1, "content-length"), None);
+
+    let addr = backend_with(b"HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\n\r\n".to_vec()).await;
+    let (_, frames) = run("GET", &addr).await;
+    let (status, headers) = response_of(&frames[0]);
+    assert_eq!((status, header(&headers, "etag"), header(&headers, "content-length")), (304, Some("\"abc\""), None));
+  }
+
+  #[tokio::test]
+  async fn interim_responses_are_skipped() {
+    let addr = backend_with(
+      b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+    ).await;
+    let (result, frames) = run("POST", &addr).await;
+    result.unwrap();
+    let (status, headers) = response_of(&frames[0]);
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "link"), None, "interim headers must not leak into the final response");
+    assert_eq!(&frames[1].payload[..], b"ok");
+  }
+
+  #[tokio::test]
+  async fn expect_header_is_not_forwarded() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let backend = tokio::spawn(async move {
+      let (mut sock, _) = listener.accept().await.unwrap();
+      let mut buf = [0u8; 4096];
+      let n = sock.read(&mut buf).await.unwrap();
+      sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+      String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+    });
+    let mut r = req("POST");
+    r.headers.push(("expect".into(), "100-continue".into()));
+    let (client_w, _server_r) = tokio::io::duplex(1 << 20);
+    let writer = Arc::new(Mutex::new(client_w));
+    let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
+    forward_to_backend(1, &r, Some(Bytes::from_static(b"data")), &addr, &writer, &senders).await.unwrap();
+    assert!(!backend.await.unwrap().contains("expect:"));
+  }
+
+  #[tokio::test]
+  async fn chunked_body_split_over_many_reads_is_complete() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+      let (mut sock, _) = listener.accept().await.unwrap();
+      let mut buf = [0u8; 4096];
+      let _ = sock.read(&mut buf).await;
+      sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+      for part in [&b"total=10\r\n\r\nfirst;"[..], b" second;", b" third"] {
+        sock.write_all(format!("{:x}\r\n", part.len()).as_bytes()).await.unwrap();
+        sock.write_all(part).await.unwrap();
+        sock.write_all(b"\r\n").await.unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      sock.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+    let (result, frames) = run("GET", &addr).await;
+    result.unwrap();
+    let body: Vec<u8> = frames[1..].iter().flat_map(|f| f.payload.to_vec()).collect();
+    assert_eq!(body, b"total=10\r\n\r\nfirst; second; third");
+    assert_eq!(header(&response_of(&frames[0]).1, "content-length"), Some("32"));
   }
 }
