@@ -6,10 +6,10 @@
 
 $ErrorActionPreference = 'Stop'
 
-$InstallDir  = "$env:ProgramFiles\OliBot\tunnel-client"
+$InstallDir  = "$env:ProgramFiles\clientproxy\tunnel-client"
 $ServiceName = 'tunnel-client'
 
-Write-Host "=== Oli.bot Tunnel Client Uninstaller ===" -ForegroundColor Cyan
+Write-Host "=== clientproxy.io Tunnel Client Uninstaller ===" -ForegroundColor Cyan
 
 $svc = "$InstallDir\tunnel-client-svc.exe"
 
@@ -31,5 +31,5 @@ $removeFiles = Read-Host "Remove program files from $InstallDir? [y/N]"
 if ($removeFiles -eq 'y' -or $removeFiles -eq 'Y') {
     Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
     Write-Host "Program files removed." -ForegroundColor Green
-    Write-Host "Note: config and logs in $env:ProgramData\OliBot\tunnel-client\ were kept."
+    Write-Host "Note: config in $env:ProgramData\clientproxy\tunnel-client\ was kept."
 }

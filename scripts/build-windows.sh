@@ -66,11 +66,11 @@ clientproxy.io Tunnel Client ${VERSION} — Windows
 INSTALL (run PowerShell as Administrator):
   1. Right-click install.ps1 → "Run with PowerShell"
      (or: powershell -ExecutionPolicy Bypass -File install.ps1)
-  2. Edit C:\ProgramData\OliBot\tunnel-client\env.conf with your credentials
+  2. Edit C:\ProgramData\clientproxy\tunnel-client\env.conf with your credentials
   3. Run: Start-Service tunnel-client
 
 LOGS:
-  C:\ProgramData\OliBot\tunnel-client\tunnel-client.log
+  C:\Program Files\clientproxy\tunnel-client\tunnel-client.log
 
 UNINSTALL:
   Right-click uninstall.ps1 → "Run with PowerShell"

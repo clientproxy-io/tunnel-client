@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Copies tunnel-client.exe and tunnel-client-svc.exe (WinSW) to Program Files,
-    creates an env.conf at C:\ProgramData\OliBot\tunnel-client\, and registers
+    creates an env.conf at C:\ProgramData\clientproxy\tunnel-client\, and registers
     the service to start automatically.
 
 .EXAMPLE
@@ -14,8 +14,8 @@
 
 $ErrorActionPreference = 'Stop'
 
-$InstallDir  = "$env:ProgramFiles\OliBot\tunnel-client"
-$ConfigDir   = "$env:ProgramData\OliBot\tunnel-client"
+$InstallDir  = "$env:ProgramFiles\clientproxy\tunnel-client"
+$ConfigDir   = "$env:ProgramData\clientproxy\tunnel-client"
 $ConfigFile  = "$ConfigDir\env.conf"
 $ServiceName = 'tunnel-client'
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -32,7 +32,20 @@ Copy-Item "$ScriptDir\tunnel-client-svc.xml" "$InstallDir\tunnel-client-svc.xml"
 # --- Create config file (only if it doesn't already exist) ---
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 if (-not (Test-Path $ConfigFile)) {
-    @'
+    $initialApiUrl = 'https://api-us.clientproxy.io/api'
+    $initialTunnelId = 'YOUR_TUNNEL_ID'
+    $initialApiKey = 'YOUR_API_KEY'
+    # Previous installers registered these values for the existing service.
+    # Preserve them when moving configuration to the clientproxy folder.
+    if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
+        $savedApiUrl = [System.Environment]::GetEnvironmentVariable('TUNNEL_API_URL', 'Machine')
+        $savedTunnelId = [System.Environment]::GetEnvironmentVariable('TUNNEL_ID', 'Machine')
+        $savedApiKey = [System.Environment]::GetEnvironmentVariable('TUNNEL_API_KEY', 'Machine')
+        if ($savedApiUrl) { $initialApiUrl = $savedApiUrl }
+        if ($savedTunnelId) { $initialTunnelId = $savedTunnelId }
+        if ($savedApiKey) { $initialApiKey = $savedApiKey }
+    }
+    @"
 # clientproxy.io Tunnel Client configuration
 # Edit this file, then run: Restart-Service tunnel-client
 
@@ -40,14 +53,14 @@ if (-not (Test-Path $ConfigFile)) {
 #   https://api-us.clientproxy.io/api   (United States)
 #   https://api-eu.clientproxy.io/api   (Europe)
 #   https://api-asia.clientproxy.io/api (Asia)
-TUNNEL_API_URL=https://api-us.clientproxy.io/api
+TUNNEL_API_URL=$initialApiUrl
 
 # Your tunnel ID from the clientproxy.io dashboard
-TUNNEL_ID=YOUR_TUNNEL_ID
+TUNNEL_ID=$initialTunnelId
 
 # Your API key (<subscriptionId>_<salt> format)
-TUNNEL_API_KEY=YOUR_API_KEY
-'@ | Set-Content $ConfigFile -Encoding UTF8
+TUNNEL_API_KEY=$initialApiKey
+"@ | Set-Content $ConfigFile -Encoding UTF8
     Write-Host "Created config at $ConfigFile" -ForegroundColor Yellow
 } else {
     Write-Host "Config already exists at $ConfigFile — not overwritten." -ForegroundColor Green

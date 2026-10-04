@@ -111,11 +111,11 @@ Open **PowerShell as Administrator** and run:
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-This installs the binary to `C:\Program Files\OliBot\tunnel-client\` and creates a config file at `C:\ProgramData\OliBot\tunnel-client\env.conf`.
+This installs the binary to `C:\Program Files\clientproxy\tunnel-client\` and creates a config file at `C:\ProgramData\clientproxy\tunnel-client\env.conf`.
 
 **Step 3 — Configure**
 
-Edit `C:\ProgramData\OliBot\tunnel-client\env.conf`:
+Edit `C:\ProgramData\clientproxy\tunnel-client\env.conf`:
 
 ```ini
 # API endpoint — choose your region:
@@ -246,10 +246,10 @@ journalctl -u tunnel-client -b        # since last boot
 
 ### Windows
 
-Logs are written to `C:\Program Files\OliBot\tunnel-client\tunnel-client.log` with automatic rotation at 10 MB (3 files kept).
+Logs are written to `C:\Program Files\clientproxy\tunnel-client\tunnel-client.log` with automatic rotation at 10 MB (3 files kept).
 
 ```powershell
-Get-Content "C:\Program Files\OliBot\tunnel-client\tunnel-client.log" -Wait -Tail 50
+Get-Content "C:\Program Files\clientproxy\tunnel-client\tunnel-client.log" -Wait -Tail 50
 ```
 
 Service events also appear in **Windows Event Viewer** → `Windows Logs → Application` (source: `tunnel-client`).
@@ -284,6 +284,28 @@ brew install mingw-w64
 rustup target add x86_64-pc-windows-gnu
 ./scripts/build-windows.sh
 ```
+
+### Synology package releases
+
+Synology package versions use `<feature version>-<build number>`, for example
+`1.1.1-0002`. **Increase the build number on every release**, even when the
+feature version changes. This is required by
+[Synology's package versioning guidance](https://help.synology.com/developer-guide/synology_package/INFO_necessary_fields.html).
+
+The package builder currently defaults `SPK_BUILD` to `0001`; both the `1.0.6`
+and `1.1.0` packages were published with that same build number. Reusing it is
+a possible cause of missing updates in Package Center. Set a higher value when
+building the next package:
+
+```bash
+# bin/ contains tunnel-client-linux-amd64, -arm64 and -armv7.
+SPK_BUILD=0002 packaging/synology/build-spk.sh 1.1.1 bin dist
+```
+
+Release automation must also pass an increasing `SPK_BUILD`. Changing only
+`Cargo.toml` or the Git tag does not increase it. Publish the generated `.spk`
+and `synology-feed.json` together so the package version, size and checksum in
+the Package Center feed match the downloadable package.
 
 ## Protocol
 
