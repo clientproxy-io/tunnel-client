@@ -288,24 +288,26 @@ rustup target add x86_64-pc-windows-gnu
 ### Synology package releases
 
 Synology package versions use `<feature version>-<build number>`, for example
-`1.1.1-0002`. **Increase the build number on every release**, even when the
+`1.1.1-1001001`. **Increase the build number on every release**, even when the
 feature version changes. This is required by
 [Synology's package versioning guidance](https://help.synology.com/developer-guide/synology_package/INFO_necessary_fields.html).
 
-The package builder currently defaults `SPK_BUILD` to `0001`; both the `1.0.6`
-and `1.1.0` packages were published with that same build number. Reusing it is
-a possible cause of missing updates in Package Center. Set a higher value when
-building the next package:
+The package builder derives the build number as
+`major * 1000000 + minor * 1000 + patch`, so version increases also increase the
+build number. Both the older `1.0.6` and `1.1.0` packages used build `0001`;
+reusing it was a possible cause of missing updates in Package Center.
 
 ```bash
 # bin/ contains tunnel-client-linux-amd64, -arm64 and -armv7.
-SPK_BUILD=0002 packaging/synology/build-spk.sh 1.1.1 bin dist
+packaging/synology/build-spk.sh 1.1.1 bin dist
 ```
 
-Release automation must also pass an increasing `SPK_BUILD`. Changing only
-`Cargo.toml` or the Git tag does not increase it. Publish the generated `.spk`
-and `synology-feed.json` together so the package version, size and checksum in
-the Package Center feed match the downloadable package.
+For a rebuild of the same feature version, set `SPK_BUILD` explicitly to a
+number higher than the previous package's build. Keep it below the next
+version's derived build, or override that next build too so it stays higher.
+Publish the generated `.spk` and `synology-feed.json` together so the package
+version, size and checksum in the Package Center feed match the downloadable
+package.
 
 ## Protocol
 

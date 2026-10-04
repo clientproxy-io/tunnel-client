@@ -16,7 +16,29 @@ VERSION="${1:?usage: build-spk.sh <version> <bin-dir> [out-dir]}"
 BIN_DIR="${2:?usage: build-spk.sh <version> <bin-dir> [out-dir]}"
 OUT_DIR="${3:-.}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
-BUILD_NUM="${SPK_BUILD:-0001}"
+# DSM requires an increasing build number even when the feature version changes.
+# Encode numeric major.minor.patch versions so normal releases increase it
+# automatically. SPK_BUILD is available for rebuilding an existing version.
+BUILD_NUM="$(python3 - "$VERSION" "${SPK_BUILD:-}" <<'PY'
+import re, sys
+version, override = sys.argv[1:]
+match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+if not match:
+    raise SystemExit("Synology version must be numeric major.minor.patch")
+major, minor, patch = map(int, match.groups())
+if minor >= 1000 or patch >= 1000:
+    raise SystemExit("Synology minor and patch versions must be below 1000")
+encoded = major * 1000000 + minor * 1000 + patch
+if override and not re.fullmatch(r"\d+", override):
+    raise SystemExit("SPK_BUILD must be a positive integer")
+build = int(override) if override else encoded
+if not 0 < build <= 2147483647:
+    raise SystemExit("Synology build number must be between 1 and 2147483647")
+if override and build < encoded:
+    raise SystemExit("SPK_BUILD must not be below the version-derived build number")
+print(build)
+PY
+)"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

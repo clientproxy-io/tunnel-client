@@ -1,6 +1,6 @@
 [package]
 name = "tunnel-client"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "Tunnel client for clientproxy.io — expose local backends through a reverse proxy tunnel"
 homepage = "https://clientproxy.io"
