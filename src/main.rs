@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{debug, info, warn};
 
@@ -38,6 +38,7 @@ enum FrameType {
   Ping     = 0x07,
   Pong     = 0x08,
   GoAway   = 0x09,
+  WindowUpdate = 0x0A,
 }
 
 impl FrameType {
@@ -52,6 +53,7 @@ impl FrameType {
       0x07 => Some(FrameType::Ping),
       0x08 => Some(FrameType::Pong),
       0x09 => Some(FrameType::GoAway),
+      0x0A => Some(FrameType::WindowUpdate),
       _    => None,
     }
   }
@@ -71,9 +73,70 @@ mod caps {
   pub const HTTP2_BACKENDS: u8 = 0x01;
   /// This client can relay WebSocket (HTTP/1.1 Upgrade) streams.
   pub const UPGRADE: u8 = 0x04;
+  /// This client streams response bodies and honours WINDOW_UPDATE flow control.
+  pub const STREAM: u8 = 0x08;
 }
 
+/// CONFIG frame flag: the server supports streamed responses (it sends WINDOW_UPDATE).
+const CONFIG_STREAMING: u8 = 0x01;
+
+/// Response DATA bytes that may be in flight per stream before the server grants more.
+const STREAM_WINDOW: usize = 1024 * 1024;
+
+/// Largest DATA payload sent for a streamed body.
+const STREAM_CHUNK: usize = 16 * 1024;
+
 type BodySenders = Arc<Mutex<HashMap<u32, mpsc::Sender<Option<Bytes>>>>>;
+
+/// Flow control and cancellation for one streamed response (client → server DATA).
+struct StreamCtl {
+  /// Bytes we may still send; the server refills it with WINDOW_UPDATE as it delivers data.
+  window: Semaphore,
+  cancel: watch::Sender<bool>,
+}
+
+impl StreamCtl {
+  fn new() -> Arc<Self> {
+    Arc::new(Self { window: Semaphore::new(STREAM_WINDOW), cancel: watch::channel(false).0 })
+  }
+
+  /// The server reset the stream (visitor gone): wake anything waiting on the window or the backend.
+  fn abort(&self) {
+    self.window.close();
+    self.cancel.send_replace(true);
+  }
+
+  fn grant(&self, credit: usize) {
+    // A misbehaving server must not be able to overflow the semaphore.
+    let room = (STREAM_WINDOW * 2).saturating_sub(self.window.available_permits());
+    self.window.add_permits(credit.min(room));
+  }
+}
+
+type Streams = Arc<Mutex<HashMap<u32, Arc<StreamCtl>>>>;
+
+/// What the session negotiated and tracks for streamed responses.
+struct StreamCtx {
+  /// Server advertised streaming in CONFIG; otherwise responses are buffered as before.
+  streaming: bool,
+  streams: Streams,
+}
+
+impl StreamCtx {
+  #[cfg(test)]
+  fn buffered() -> Self {
+    Self { streaming: false, streams: Arc::new(Mutex::new(HashMap::new())) }
+  }
+}
+
+async fn cancelled(rx: &mut watch::Receiver<bool>) {
+  loop {
+    if *rx.borrow() { return; }
+    if rx.changed().await.is_err() {
+      std::future::pending::<()>().await;
+    }
+  }
+}
 
 mod reset_codes {
   pub const BACKEND_UNREACHABLE: u16 = 0x01;
@@ -125,7 +188,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> std::io
 fn build_connect_payload(tunnel_id: &str, api_key: &str) -> Bytes {
   let mut buf = BytesMut::new();
   buf.put_u8(0x02); // protocol version 2
-  buf.put_u8(caps::HTTP2_BACKENDS | caps::UPGRADE);
+  buf.put_u8(caps::HTTP2_BACKENDS | caps::UPGRADE | caps::STREAM);
   buf.put_u16(tunnel_id.len() as u16);
   buf.extend_from_slice(tunnel_id.as_bytes());
   buf.put_u16(api_key.len() as u16);
@@ -499,6 +562,12 @@ where
   let config = parse_config(&config_frame.payload)
     .ok_or("Failed to parse CONFIG payload")?;
 
+  let ctx = Arc::new(StreamCtx {
+    streaming: config_frame.has_flag(CONFIG_STREAMING),
+    streams: Arc::new(Mutex::new(HashMap::new())),
+  });
+  if ctx.streaming { debug!("Server supports streamed responses"); }
+
   // Build domain_id → backend_host map
   let domain_map: Arc<HashMap<u16, String>> = Arc::new(
     config.domains.iter().map(|d| { info!("  domain_id={} → {}", d.domain_id, d.local_host); (d.domain_id, d.local_host.clone()) }).collect()
@@ -572,14 +641,15 @@ where
         let writer_c   = writer.clone();
         let domain_map = domain_map.clone();
         let body_senders_c = body_senders.clone();
+        let ctx_c = ctx.clone();
 
         if has_body {
           // Create a channel for body DATA frames
           let (body_tx, body_rx) = mpsc::channel::<Option<Bytes>>(64);
           body_senders.lock().await.insert(stream_id, body_tx);
-          tokio::spawn(handle_stream(stream_id, req, Some(body_rx), writer_c, domain_map, body_senders_c));
+          tokio::spawn(handle_stream(stream_id, req, Some(body_rx), writer_c, domain_map, body_senders_c, ctx_c));
         } else {
-          tokio::spawn(handle_stream(stream_id, req, None, writer_c, domain_map, body_senders_c));
+          tokio::spawn(handle_stream(stream_id, req, None, writer_c, domain_map, body_senders_c, ctx_c));
         }
       }
 
@@ -601,6 +671,18 @@ where
         let code = if frame.payload.len() >= 2 { u16::from_be_bytes([frame.payload[0], frame.payload[1]]) } else { 0 };
         debug!("RESET stream_id={} code={}", stream_id, code);
         body_senders.lock().await.remove(&stream_id);
+        if let Some(ctl) = ctx.streams.lock().await.remove(&stream_id) {
+          ctl.abort();
+        }
+      }
+
+      FrameType::WindowUpdate => {
+        if frame.payload.len() >= 4 {
+          let credit = u32::from_be_bytes([frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3]]) as usize;
+          if let Some(ctl) = ctx.streams.lock().await.get(&frame.stream_id) {
+            ctl.grant(credit);
+          }
+        }
       }
 
       FrameType::Ping => {
@@ -639,6 +721,7 @@ async fn handle_stream(
   writer: Arc<Mutex<impl AsyncWrite + Unpin + Send>>,
   domain_map: Arc<HashMap<u16, String>>,
   body_senders: Arc<Mutex<HashMap<u32, mpsc::Sender<Option<Bytes>>>>>,
+  ctx: Arc<StreamCtx>,
 ) {
   let backend = match domain_map.get(&req.domain_id) {
     Some(h) => h.clone(),
@@ -666,7 +749,7 @@ async fn handle_stream(
   debug!("stream {} → {} {} {}", stream_id, req.method, req.path, backend);
 
   // Make HTTP/1.1 request to local backend
-  let result = forward_to_backend(stream_id, &req, body, &backend, &writer, &body_senders).await;
+  let result = forward_to_backend(stream_id, &req, body, &backend, &writer, &body_senders, &ctx).await;
   if let Err(e) = result {
     warn!("stream {} backend error: {}", stream_id, e);
     body_senders.lock().await.remove(&stream_id);
@@ -681,6 +764,7 @@ async fn forward_to_backend(
   backend: &str,
   writer: &Arc<Mutex<impl AsyncWrite + Unpin + Send>>,
   body_senders: &BodySenders,
+  ctx: &StreamCtx,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   let mut stream = TcpStream::connect(backend).await
     .map_err(|e| format!("Backend connect failed ({}): {}", backend, e))?;
@@ -767,6 +851,11 @@ async fn forward_to_backend(
     let leftover = resp_buf[header_end..].to_vec();
     let (tx, rx) = mpsc::channel::<Option<Bytes>>(64);
     body_senders.lock().await.insert(stream_id, tx);
+    // The server paces backend → browser bytes with WINDOW_UPDATE when it supports streaming.
+    let ctl = ctx.streaming.then(StreamCtl::new);
+    if let Some(ctl) = &ctl {
+      ctx.streams.lock().await.insert(stream_id, ctl.clone());
+    }
 
     let resp_frame = Frame {
       frame_type: FrameType::Response,
@@ -783,12 +872,14 @@ async fn forward_to_backend(
     };
     if let Err(e) = sent {
       body_senders.lock().await.remove(&stream_id);
+      ctx.streams.lock().await.remove(&stream_id);
       return Err(e.into());
     }
 
     debug!("stream {} upgraded: {} {}", stream_id, req.path, backend);
-    relay_upgraded(stream_id, stream, leftover, rx, writer).await;
+    relay_upgraded(stream_id, stream, leftover, rx, writer, ctl.as_deref()).await;
     body_senders.lock().await.remove(&stream_id);
+    ctx.streams.lock().await.remove(&stream_id);
     debug!("stream {} upgrade closed", stream_id);
     return Ok(());
   }
@@ -796,6 +887,41 @@ async fn forward_to_backend(
   // Status codes that carry no body per RFC 7230 §3.3
   let no_body = (100..200).contains(&status_code) || status_code == 204 || status_code == 304
     || req.method.eq_ignore_ascii_case("HEAD");
+
+  // Stream the body as it arrives (SSE, big downloads) when the server paces it with WINDOW_UPDATE.
+  if ctx.streaming && !no_body && content_length != Some(0) {
+    let framing = match content_length {
+      Some(n) => Framing::Length(n),
+      None if is_chunked => Framing::Chunked,
+      None => Framing::UntilClose,
+    };
+    let leftover = resp_buf[header_end..].to_vec();
+    let ctl = StreamCtl::new();
+    ctx.streams.lock().await.insert(stream_id, ctl.clone());
+
+    // Headers go out as the backend sent them: Content-Length is kept when there is one, and
+    // absent for chunked / close-delimited bodies (the proxy frames those for the visitor).
+    let resp_frame = Frame {
+      frame_type: FrameType::Response,
+      stream_id,
+      flags: flags::RESPONSE_HAS_BODY,
+      payload: build_response_payload(status_code, &resp_headers),
+    };
+    let sent = {
+      let mut w = writer.lock().await;
+      match write_frame(&mut *w, &resp_frame).await {
+        Ok(()) => w.flush().await,
+        Err(e) => Err(e),
+      }
+    };
+    let result = match sent {
+      Ok(()) => stream_response_body(stream_id, &mut stream, leftover, framing, writer, &ctl, &mut tmp).await,
+      Err(e) => Err(e.into()),
+    };
+    ctx.streams.lock().await.remove(&stream_id);
+    debug!("stream {} streamed: {} {}", stream_id, status_code, backend);
+    return result;
+  }
 
   // Body already partially read (bytes after header_end)
   let mut body_buf: Vec<u8> = if no_body { Vec::new() } else { resp_buf[header_end..].to_vec() };
@@ -891,6 +1017,159 @@ async fn send_data(
   write_frame(&mut *w, &frame).await.is_ok() && w.flush().await.is_ok()
 }
 
+/// Send a DATA frame, first waiting for flow-control credit when the stream is paced.
+/// Err = the stream was cancelled (server reset) or the tunnel is gone.
+async fn send_paced(
+  writer: &Arc<Mutex<impl AsyncWrite + Unpin + Send>>,
+  stream_id: u32,
+  ctl: Option<&StreamCtl>,
+  payload: Bytes,
+) -> Result<(), String> {
+  for piece in payload.chunks(STREAM_CHUNK) {
+    if let Some(ctl) = ctl {
+      ctl.window.acquire_many(piece.len() as u32).await.map_err(|_| "stream cancelled by server".to_string())?.forget();
+    }
+    if !send_data(writer, stream_id, 0, Bytes::copy_from_slice(piece)).await {
+      return Err("tunnel closed".to_string());
+    }
+  }
+  Ok(())
+}
+
+/// How the backend delimits its response body.
+enum Framing {
+  Length(usize),
+  Chunked,
+  UntilClose,
+}
+
+/// Relay a response body to the server as it arrives, honouring flow control, and finish
+/// with an empty END_STREAM DATA frame. An error resets the stream (the visitor's download
+/// fails instead of ending "complete").
+async fn stream_response_body(
+  stream_id: u32,
+  stream: &mut TcpStream,
+  leftover: Vec<u8>,
+  framing: Framing,
+  writer: &Arc<Mutex<impl AsyncWrite + Unpin + Send>>,
+  ctl: &StreamCtl,
+  tmp: &mut [u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  let mut cancel = ctl.cancel.subscribe();
+  let mut decoder = ChunkDecoder::new();
+  let mut remaining = if let Framing::Length(n) = framing { n } else { 0 };
+  let mut input = leftover;
+  loop {
+    let mut done = false;
+    if !input.is_empty() {
+      let mut out = Vec::new();
+      match framing {
+        Framing::Length(_) => {
+          let take = input.len().min(remaining);
+          out.extend_from_slice(&input[..take]);
+          remaining -= take;
+          done = remaining == 0;
+        }
+        Framing::Chunked => done = decoder.feed(&input, &mut out)?,
+        Framing::UntilClose => out = std::mem::take(&mut input),
+      }
+      send_paced(writer, stream_id, Some(ctl), Bytes::from(out)).await?;
+      input.clear();
+    } else if let Framing::Length(0) = framing {
+      done = true;
+    }
+    if done { break; }
+
+    let n = tokio::select! {
+      r = stream.read(tmp) => r?,
+      _ = cancelled(&mut cancel) => return Err("stream cancelled by server".into()),
+    };
+    if n == 0 {
+      match framing {
+        Framing::UntilClose => break,
+        Framing::Length(_) => return Err(format!("Backend closed with {} body bytes missing", remaining).into()),
+        Framing::Chunked => return Err("Backend closed in the middle of a chunked response".into()),
+      }
+    }
+    input.extend_from_slice(&tmp[..n]);
+  }
+  if !send_data(writer, stream_id, flags::END_STREAM, Bytes::new()).await {
+    return Err("tunnel closed".into());
+  }
+  Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ChunkState {
+  Size,
+  Data(usize),
+  DataCr,
+  DataLf,
+  Trailer,
+  Done,
+}
+
+/// Incremental chunked-body decoder for streamed responses: bytes can arrive in any split.
+struct ChunkDecoder {
+  state: ChunkState,
+  line: Vec<u8>,
+}
+
+impl ChunkDecoder {
+  fn new() -> Self {
+    Self { state: ChunkState::Size, line: Vec::new() }
+  }
+
+  /// Feed wire bytes; decoded body bytes are appended to `out`. Ok(true) once the
+  /// terminating chunk and trailers have been consumed.
+  fn feed(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<bool, String> {
+    while !input.is_empty() {
+      match self.state {
+        ChunkState::Size | ChunkState::Trailer => {
+          let b = input[0];
+          input = &input[1..];
+          if b != b'\n' {
+            if self.line.len() >= 4096 { return Err("chunk header line too long".into()); }
+            self.line.push(b);
+            continue;
+          }
+          let line = std::mem::take(&mut self.line);
+          let line = line.strip_suffix(b"\r").unwrap_or(&line);
+          if let ChunkState::Trailer = self.state {
+            if line.is_empty() {
+              self.state = ChunkState::Done;
+              return Ok(true);
+            }
+            continue; // a trailer header: ignored
+          }
+          let text = std::str::from_utf8(line).map_err(|_| "invalid chunk size line".to_string())?;
+          let size = usize::from_str_radix(text.split(';').next().unwrap_or("").trim(), 16)
+            .map_err(|_| "invalid chunk size".to_string())?;
+          self.state = if size == 0 { ChunkState::Trailer } else { ChunkState::Data(size) };
+        }
+        ChunkState::Data(rem) => {
+          let n = rem.min(input.len());
+          out.extend_from_slice(&input[..n]);
+          input = &input[n..];
+          self.state = if n == rem { ChunkState::DataCr } else { ChunkState::Data(rem - n) };
+        }
+        ChunkState::DataCr => {
+          if input[0] != b'\r' { return Err("missing CR after chunk data".into()); }
+          input = &input[1..];
+          self.state = ChunkState::DataLf;
+        }
+        ChunkState::DataLf => {
+          if input[0] != b'\n' { return Err("missing LF after chunk data".into()); }
+          input = &input[1..];
+          self.state = ChunkState::Size;
+        }
+        ChunkState::Done => return Ok(true),
+      }
+    }
+    Ok(matches!(self.state, ChunkState::Done))
+  }
+}
+
 enum TunnelEnd {
   /// Server sent END_STREAM: the browser half-closed.
   HalfClosed,
@@ -905,6 +1184,7 @@ async fn relay_upgraded(
   leftover: Vec<u8>,
   mut body_rx: mpsc::Receiver<Option<Bytes>>,
   writer: &Arc<Mutex<impl AsyncWrite + Unpin + Send>>,
+  ctl: Option<&StreamCtl>,
 ) {
   /// After one side closes, how long the other gets to finish its close handshake.
   const HALF_CLOSE_GRACE: Duration = Duration::from_secs(5);
@@ -913,7 +1193,7 @@ async fn relay_upgraded(
   // backend → tunnel
   let up = async {
     // Bytes the backend sent right behind its 101 headers.
-    if !leftover.is_empty() && !send_data(writer, stream_id, 0, Bytes::from(leftover)).await {
+    if !leftover.is_empty() && send_paced(writer, stream_id, ctl, Bytes::from(leftover)).await.is_err() {
       return;
     }
     let mut buf = vec![0u8; 16 * 1024];
@@ -924,7 +1204,7 @@ async fn relay_upgraded(
           break;
         }
         Ok(n) => {
-          if !send_data(writer, stream_id, 0, Bytes::copy_from_slice(&buf[..n])).await { break; }
+          if send_paced(writer, stream_id, ctl, Bytes::copy_from_slice(&buf[..n])).await.is_err() { break; }
         }
       }
     }
@@ -1105,7 +1385,7 @@ mod upgrade_tests {
     let writer = Arc::new(Mutex::new(client_w));
     let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
     let (w, s) = (writer.clone(), senders.clone());
-    let task = tokio::spawn(async move { forward_to_backend(9, &request(true), None, &addr, &w, &s).await });
+    let task = tokio::spawn(async move { forward_to_backend(9, &request(true), None, &addr, &w, &s, &StreamCtx::buffered()).await });
 
     let resp = read_frame(&mut server_r).await.unwrap();
     assert_eq!(resp.frame_type, FrameType::Response);
@@ -1147,7 +1427,7 @@ mod upgrade_tests {
     let (client_w, mut server_r) = tokio::io::duplex(1 << 20);
     let writer = Arc::new(Mutex::new(client_w));
     let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
-    forward_to_backend(3, &request(true), None, &addr, &writer, &senders).await.unwrap();
+    forward_to_backend(3, &request(true), None, &addr, &writer, &senders, &StreamCtx::buffered()).await.unwrap();
 
     let resp = read_frame(&mut server_r).await.unwrap();
     assert_eq!(resp.frame_type, FrameType::Response);
@@ -1172,7 +1452,7 @@ mod upgrade_tests {
     let (client_w, mut server_r) = tokio::io::duplex(1 << 20);
     let writer = Arc::new(Mutex::new(client_w));
     let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
-    forward_to_backend(4, &request(false), None, &addr, &writer, &senders).await.unwrap();
+    forward_to_backend(4, &request(false), None, &addr, &writer, &senders, &StreamCtx::buffered()).await.unwrap();
 
     let head = backend.await.unwrap();
     assert!(head.contains("connection: close"));
@@ -1234,7 +1514,7 @@ mod http_semantics_tests {
     let (client_w, mut server_r) = tokio::io::duplex(1 << 20);
     let writer = Arc::new(Mutex::new(client_w));
     let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
-    let result = forward_to_backend(1, &req(method), None, addr, &writer, &senders).await.map_err(|e| e.to_string());
+    let result = forward_to_backend(1, &req(method), None, addr, &writer, &senders, &StreamCtx::buffered()).await.map_err(|e| e.to_string());
     drop(writer); // close our end so the reads below end at EOF
     let mut frames = Vec::new();
     while let Ok(f) = read_frame(&mut server_r).await { frames.push(f); }
@@ -1319,7 +1599,7 @@ mod http_semantics_tests {
     let (client_w, _server_r) = tokio::io::duplex(1 << 20);
     let writer = Arc::new(Mutex::new(client_w));
     let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
-    forward_to_backend(1, &r, Some(Bytes::from_static(b"data")), &addr, &writer, &senders).await.unwrap();
+    forward_to_backend(1, &r, Some(Bytes::from_static(b"data")), &addr, &writer, &senders, &StreamCtx::buffered()).await.unwrap();
     assert!(!backend.await.unwrap().contains("expect:"));
   }
 
@@ -1346,5 +1626,185 @@ mod http_semantics_tests {
     let body: Vec<u8> = frames[1..].iter().flat_map(|f| f.payload.to_vec()).collect();
     assert_eq!(body, b"total=10\r\n\r\nfirst; second; third");
     assert_eq!(header(&response_of(&frames[0]).1, "content-length"), Some("32"));
+  }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+  use super::*;
+  use tokio::net::TcpListener;
+  use tokio::sync::Notify;
+
+  fn decode_bytewise(wire: &[u8]) -> Result<(Vec<u8>, bool), String> {
+    let mut d = ChunkDecoder::new();
+    let mut out = Vec::new();
+    let mut done = false;
+    for b in wire { done = d.feed(std::slice::from_ref(b), &mut out)?; }
+    Ok((out, done))
+  }
+
+  #[test]
+  fn incremental_chunk_decoder_handles_any_split() {
+    let wire = b"9\r\ndata: 0\n\n\r\n5;ext=1\r\n0\r\n\r\n\r\n0\r\nX-T: v\r\n\r\n";
+    let (out, done) = decode_bytewise(wire).unwrap();
+    assert_eq!(out, b"data: 0\n\n0\r\n\r\n");
+    assert!(done);
+    // Every possible two-way split decodes the same.
+    for cut in 0..wire.len() {
+      let mut d = ChunkDecoder::new();
+      let mut out = Vec::new();
+      assert!(!d.feed(&wire[..cut], &mut out).unwrap() || cut == wire.len());
+      assert!(d.feed(&wire[cut..], &mut out).unwrap());
+      assert_eq!(out, b"data: 0\n\n0\r\n\r\n", "split at {cut}");
+    }
+    // Not finished until the trailer section ends.
+    let (_, done) = decode_bytewise(b"3\r\nabc\r\n0\r\n").unwrap();
+    assert!(!done);
+    assert!(decode_bytewise(b"zz\r\n").is_err());
+    assert!(decode_bytewise(b"3\r\nabcXX").is_err());
+  }
+
+  struct Rig {
+    server_r: tokio::io::DuplexStream,
+    task: tokio::task::JoinHandle<Result<(), String>>,
+    ctx: Arc<StreamCtx>,
+  }
+
+  /// Run forward_to_backend with streaming on against a backend that runs `serve`.
+  async fn rig<F, Fut>(serve: F) -> Rig
+  where
+    F: FnOnce(TcpStream) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+  {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+      let (mut sock, _) = listener.accept().await.unwrap();
+      let mut buf = [0u8; 4096];
+      let _ = sock.read(&mut buf).await;
+      serve(sock).await;
+    });
+    let (client_w, server_r) = tokio::io::duplex(8 << 20);
+    let writer = Arc::new(Mutex::new(client_w));
+    let senders: BodySenders = Arc::new(Mutex::new(HashMap::new()));
+    let ctx = Arc::new(StreamCtx { streaming: true, streams: Arc::new(Mutex::new(HashMap::new())) });
+    let req = RequestPayload { domain_id: 1, method: "GET".into(), path: "/".into(),
+      headers: vec![("host".into(), "x.example".into())], upgrade: false };
+    let c = ctx.clone();
+    let task = tokio::spawn(async move {
+      forward_to_backend(1, &req, None, &addr, &writer, &senders, &c).await.map_err(|e| e.to_string())
+    });
+    Rig { server_r, task, ctx }
+  }
+
+  async fn frame(r: &mut tokio::io::DuplexStream) -> Frame {
+    tokio::time::timeout(Duration::from_secs(5), read_frame(r)).await.expect("frame within 5s").unwrap()
+  }
+
+  #[tokio::test]
+  async fn chunked_response_is_relayed_before_it_finishes() {
+    let release = Arc::new(Notify::new());
+    let r2 = release.clone();
+    let mut rig = rig(move |mut sock| async move {
+      sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata: 0\n\n\r\n").await.unwrap();
+      r2.notified().await; // hold the stream open until the test has seen event 0
+      sock.write_all(b"9\r\ndata: 1\n\n\r\n0\r\n\r\n").await.unwrap();
+    }).await;
+
+    let resp = frame(&mut rig.server_r).await;
+    assert_eq!(resp.frame_type, FrameType::Response);
+    assert!(resp.has_flag(flags::RESPONSE_HAS_BODY));
+    assert!(!String::from_utf8_lossy(&resp.payload).to_ascii_lowercase().contains("content-length"));
+    let first = frame(&mut rig.server_r).await;
+    assert_eq!(&first.payload[..], b"data: 0\n\n", "first event must arrive while the response is still open");
+
+    release.notify_one();
+    let second = frame(&mut rig.server_r).await;
+    assert_eq!(&second.payload[..], b"data: 1\n\n");
+    let end = frame(&mut rig.server_r).await;
+    assert!(end.has_flag(flags::END_STREAM) && end.payload.is_empty());
+    rig.task.await.unwrap().unwrap();
+    assert!(rig.ctx.streams.lock().await.is_empty());
+  }
+
+  #[tokio::test]
+  async fn sending_stops_at_the_window_and_resumes_on_credit() {
+    let total = 3 * STREAM_WINDOW;
+    let mut rig = rig(move |mut sock| async move {
+      sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n").as_bytes()).await.unwrap();
+      let block = vec![7u8; 64 * 1024];
+      for _ in 0..(total / block.len()) { sock.write_all(&block).await.unwrap(); }
+    }).await;
+
+    assert_eq!(frame(&mut rig.server_r).await.frame_type, FrameType::Response);
+    let mut got = 0usize;
+    // Drain until the client goes quiet: it must have stopped at the window.
+    while let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(400), read_frame(&mut rig.server_r)).await {
+      got += f.payload.len();
+    }
+    // Whole pieces only: it stops within one chunk of the window and never beyond it.
+    assert!(got <= STREAM_WINDOW && got > STREAM_WINDOW - STREAM_CHUNK, "sent {got} bytes against a window of {STREAM_WINDOW}");
+    assert!(!rig.task.is_finished());
+
+    // The server delivers data and grants credit: the rest flows.
+    let ctl = rig.ctx.streams.lock().await.get(&1).cloned().expect("stream registered");
+    ctl.grant(STREAM_WINDOW);
+    ctl.grant(STREAM_WINDOW);
+    let mut ended = false;
+    while got < total || !ended {
+      let f = frame(&mut rig.server_r).await;
+      got += f.payload.len();
+      ended |= f.has_flag(flags::END_STREAM);
+    }
+    assert_eq!(got, total);
+    rig.task.await.unwrap().unwrap();
+  }
+
+  #[tokio::test]
+  async fn server_reset_stops_an_idle_stream() {
+    let mut rig = rig(|mut sock| async move {
+      sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+      tokio::time::sleep(Duration::from_secs(30)).await; // silent SSE
+    }).await;
+    assert_eq!(frame(&mut rig.server_r).await.frame_type, FrameType::Response);
+    // Visitor went away → the server's RESET reaches the client's reader loop → abort().
+    let ctl = rig.ctx.streams.lock().await.get(&1).cloned().unwrap();
+    ctl.abort();
+    let result = tokio::time::timeout(Duration::from_secs(2), rig.task).await.expect("must stop promptly").unwrap();
+    assert!(result.is_err());
+  }
+
+  #[tokio::test]
+  async fn truncated_streamed_body_ends_without_end_stream() {
+    let mut rig = rig(|mut sock| async move {
+      sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nonly-some").await.unwrap();
+    }).await;
+    assert_eq!(frame(&mut rig.server_r).await.frame_type, FrameType::Response);
+    assert_eq!(&frame(&mut rig.server_r).await.payload[..], b"only-some");
+    let result = rig.task.await.unwrap();
+    assert!(result.is_err(), "the stream must be reset, not ended cleanly");
+    // No END_STREAM was sent.
+    drop(rig.server_r);
+  }
+
+  #[tokio::test]
+  async fn close_delimited_body_streams_until_eof_and_bodyless_responses_skip_streaming() {
+    let mut rig = rig(|mut sock| async move {
+      sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nstream-until-close").await.unwrap();
+    }).await;
+    assert!(frame(&mut rig.server_r).await.has_flag(flags::RESPONSE_HAS_BODY));
+    assert_eq!(&frame(&mut rig.server_r).await.payload[..], b"stream-until-close");
+    assert!(frame(&mut rig.server_r).await.has_flag(flags::END_STREAM));
+    rig.task.await.unwrap().unwrap();
+
+    let mut rig = rig_204().await;
+    let resp = frame(&mut rig.server_r).await;
+    assert_eq!(resp.frame_type, FrameType::Response);
+    assert!(!resp.has_flag(flags::RESPONSE_HAS_BODY));
+    rig.task.await.unwrap().unwrap();
+  }
+
+  async fn rig_204() -> Rig {
+    rig(|mut sock| async move { sock.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap(); }).await
   }
 }
