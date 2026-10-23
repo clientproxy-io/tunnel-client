@@ -39,6 +39,8 @@ enum FrameType {
   Pong     = 0x08,
   GoAway   = 0x09,
   WindowUpdate = 0x0A,
+  RawOpen = 0x0B,
+  RawReady = 0x0C,
 }
 
 impl FrameType {
@@ -54,6 +56,8 @@ impl FrameType {
       0x08 => Some(FrameType::Pong),
       0x09 => Some(FrameType::GoAway),
       0x0A => Some(FrameType::WindowUpdate),
+      0x0B => Some(FrameType::RawOpen),
+      0x0C => Some(FrameType::RawReady),
       _    => None,
     }
   }
@@ -75,6 +79,7 @@ mod caps {
   pub const UPGRADE: u8 = 0x04;
   /// This client streams response bodies and honours WINDOW_UPDATE flow control.
   pub const STREAM: u8 = 0x08;
+  pub const TLS_PASSTHROUGH: u8 = 0x10;
 }
 
 /// CONFIG frame flag: the server supports streamed responses (it sends WINDOW_UPDATE).
@@ -188,7 +193,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> std::io
 fn build_connect_payload(tunnel_id: &str, api_key: &str) -> Bytes {
   let mut buf = BytesMut::new();
   buf.put_u8(0x02); // protocol version 2
-  buf.put_u8(caps::HTTP2_BACKENDS | caps::UPGRADE | caps::STREAM);
+  buf.put_u8(caps::HTTP2_BACKENDS | caps::UPGRADE | caps::STREAM | caps::TLS_PASSTHROUGH);
   buf.put_u16(tunnel_id.len() as u16);
   buf.extend_from_slice(tunnel_id.as_bytes());
   buf.put_u16(api_key.len() as u16);
@@ -218,8 +223,8 @@ struct ConfigPayload {
 }
 struct DomainEntry {
   domain_id: u16,
-  _flags: u8,
-  _domain: String,
+  flags: u8,
+  domain: String,
   local_host: String,
 }
 
@@ -243,7 +248,7 @@ fn parse_config(payload: &[u8]) -> Option<ConfigPayload> {
     let flags = payload[pos]; pos += 1;
     let domain = read_u16_str(payload, &mut pos)?;
     let local_host = read_u16_str(payload, &mut pos)?;
-    domains.push(DomainEntry { domain_id, _flags: flags, _domain: domain, local_host });
+    domains.push(DomainEntry { domain_id, flags, domain, local_host });
   }
   Some(ConfigPayload { domains })
 }
@@ -300,6 +305,7 @@ struct Args {
   tls_server_name: Option<String>,
   tls_ca_cert_path: Option<String>,
   verbose: bool,
+  expected_raw: HashMap<u16, (String, String)>,
 }
 
 impl Args {
@@ -338,13 +344,14 @@ impl Args {
       tls_server_name: matches.get_one::<String>("tls-server-name").filter(|s| !s.is_empty()).cloned(),
       tls_ca_cert_path: matches.get_one::<String>("tls-ca-cert-path").filter(|s| !s.is_empty()).cloned(),
       verbose: matches.get_flag("verbose"),
+      expected_raw: HashMap::new(),
     })
   }
 }
 
 // ─── API: validate tunnel and get proxy address ───────────────────────────────
 
-async fn fetch_tunnel_info(api_url: &str, tunnel_id: &str, api_key: &str) -> Result<String, String> {
+async fn fetch_tunnel_info(api_url: &str, tunnel_id: &str, api_key: &str) -> Result<(String, HashMap<u16, (String, String)>), String> {
   use http_body_util::Full;
   let url = format!("{}/client-tunnel/{}", api_url, tunnel_id);
   let https = hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots().https_or_http().enable_http1().build();
@@ -360,7 +367,24 @@ async fn fetch_tunnel_info(api_url: &str, tunnel_id: &str, api_key: &str) -> Res
   let status = res.status();
   let body = String::from_utf8_lossy(&res.into_body().collect().await.map_err(|e| e.to_string())?.to_bytes()).to_string();
   if status.is_success() {
-    extract_string_field(&body, "proxyAddress").ok_or_else(|| "No proxyAddress in response".to_string())
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let address = value.get("proxyAddress").and_then(|v| v.as_str()).ok_or("No proxyAddress in response")?.to_string();
+    let mut required = HashMap::new();
+    if let Some(domains) = value.get("domains").and_then(|v| v.as_array()) {
+      for domain in domains {
+        match domain.get("tlsMode").and_then(|v| v.as_str()).unwrap_or("proxy") {
+          "proxy" => {}
+          "passthrough" => {
+            let id = domain.get("domainId").and_then(|v| v.as_u64()).filter(|id| *id > 0 && *id <= u16::MAX as u64).ok_or("Invalid passthrough domain ID")?;
+            let name = domain.get("domain").and_then(|v| v.as_str()).ok_or("Missing passthrough hostname")?;
+            let local = domain.get("localIp").and_then(|v| v.as_str()).ok_or("Missing passthrough TLS target")?;
+            required.insert(id as u16, (name.to_ascii_lowercase(), local.to_string()));
+          }
+          _ => return Err("Unknown domain TLS mode".into()),
+        }
+      }
+    }
+    Ok((address, required))
   } else {
     Err(format!("API error {}: {}", status, body))
   }
@@ -428,7 +452,7 @@ async fn resolve_to_ip(hostname: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-  let args = Args::parse()?;
+  let mut args = Args::parse()?;
   tracing_subscriber::fmt()
     .with_max_level(if args.verbose { tracing::Level::DEBUG } else { tracing::Level::INFO })
     // No colour codes when logging to a file, journald or `docker logs`
@@ -450,7 +474,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   loop {
     // Re-fetch proxy address on every reconnect so address changes take effect without restart
     let proxy_addr = match fetch_tunnel_info(&args.api_url, &args.tunnel_id, &args.api_key).await {
-      Ok(addr) => {
+      Ok((addr, expected_raw)) => {
+        args.expected_raw = expected_raw;
         let addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, default_port) };
         if last_proxy_addr.as_deref() != Some(&addr) {
           info!("Proxy address: {}", addr);
@@ -562,15 +587,23 @@ where
   let config = parse_config(&config_frame.payload)
     .ok_or("Failed to parse CONFIG payload")?;
 
+  validate_tls_modes(&config, config_frame.flags, &args.expected_raw)?;
+
   let ctx = Arc::new(StreamCtx {
     streaming: config_frame.has_flag(CONFIG_STREAMING),
     streams: Arc::new(Mutex::new(HashMap::new())),
   });
   if ctx.streaming { debug!("Server supports streamed responses"); }
 
+  let raw_domains: Arc<HashMap<u16, String>> = Arc::new(config.domains.iter()
+    .filter(|d| d.flags & 0x04 != 0).map(|d| (d.domain_id, d.local_host.clone())).collect());
+  if !raw_domains.is_empty() && !ctx.streaming { return Err("TLS passthrough requires flow control".into()); }
+  let raw_senders: BodySenders = Default::default();
+  let _raw_guard = RawSessionGuard { senders: raw_senders.clone(), ctx: ctx.clone() };
+
   // Build domain_id → backend_host map
   let domain_map: Arc<HashMap<u16, String>> = Arc::new(
-    config.domains.iter().map(|d| { info!("  domain_id={} → {}", d.domain_id, d.local_host); (d.domain_id, d.local_host.clone()) }).collect()
+    config.domains.iter().filter(|d| d.flags & 0x04 == 0).map(|d| { info!("  domain_id={} → {}", d.domain_id, d.local_host); (d.domain_id, d.local_host.clone()) }).collect()
   );
   info!("CONFIG received: {} domain mappings", domain_map.len());
 
@@ -628,6 +661,26 @@ where
     };
 
     match frame.frame_type {
+      FrameType::RawOpen => {
+        let id = frame.stream_id;
+        if id == 0 || frame.payload.len() != 2 || raw_senders.lock().await.len() >= 128 {
+          send_reset(&writer, id, reset_codes::INTERNAL_ERROR).await;
+          continue;
+        }
+        let domain_id = u16::from_be_bytes(frame.payload[..2].try_into().unwrap());
+        let Some(backend) = raw_domains.get(&domain_id).cloned() else {
+          send_reset(&writer, id, reset_codes::BACKEND_UNREACHABLE).await;
+          continue;
+        };
+        if ctx.streams.lock().await.contains_key(&id) || raw_senders.lock().await.contains_key(&id) {
+          return Err("Duplicate raw stream identifier".into());
+        }
+        let (tx, rx) = mpsc::channel(68);
+        let ctl = StreamCtl::new();
+        raw_senders.lock().await.insert(id, tx);
+        ctx.streams.lock().await.insert(id, ctl.clone());
+        tokio::spawn(handle_raw_stream(id, backend, rx, writer.clone(), raw_senders.clone(), ctx.clone(), ctl));
+      }
       FrameType::Request => {
         let mut req = match parse_request(&frame.payload) {
           Some(r) => r,
@@ -656,6 +709,17 @@ where
       FrameType::Data => {
         let stream_id = frame.stream_id;
         let is_end    = frame.has_flag(flags::END_STREAM);
+        let raw = raw_senders.lock().await.get(&stream_id).cloned();
+        if let Some(tx) = raw {
+          if frame.payload.len() > STREAM_CHUNK ||
+              (!frame.payload.is_empty() && tx.try_send(Some(frame.payload)).is_err()) ||
+              (is_end && tx.try_send(None).is_err()) {
+            raw_senders.lock().await.remove(&stream_id);
+            if let Some(ctl) = ctx.streams.lock().await.get(&stream_id) { ctl.abort(); }
+            send_reset(&writer, stream_id, reset_codes::INTERNAL_ERROR).await;
+          }
+          continue;
+        }
         let mut senders = body_senders.lock().await;
         if let Some(tx) = senders.get(&stream_id) {
           let _ = tx.send(Some(frame.payload)).await;
@@ -671,6 +735,7 @@ where
         let code = if frame.payload.len() >= 2 { u16::from_be_bytes([frame.payload[0], frame.payload[1]]) } else { 0 };
         debug!("RESET stream_id={} code={}", stream_id, code);
         body_senders.lock().await.remove(&stream_id);
+        raw_senders.lock().await.remove(&stream_id);
         if let Some(ctl) = ctx.streams.lock().await.remove(&stream_id) {
           ctl.abort();
         }
@@ -710,6 +775,91 @@ where
       }
     }
   }
+}
+
+// Opaque TLS streams share v2 framing but never enter the HTTP parser.
+struct RawSessionGuard { senders: BodySenders, ctx: Arc<StreamCtx> }
+impl Drop for RawSessionGuard {
+  fn drop(&mut self) {
+    let senders = self.senders.clone();
+    let ctx = self.ctx.clone();
+    tokio::spawn(async move {
+      senders.lock().await.clear();
+      for (_, ctl) in ctx.streams.lock().await.drain() { ctl.abort(); }
+    });
+  }
+}
+
+async fn handle_raw_stream<W: AsyncWrite + Unpin + Send>(
+  id: u32, backend: String, mut rx: mpsc::Receiver<Option<Bytes>>,
+  writer: Arc<Mutex<W>>, senders: BodySenders, ctx: Arc<StreamCtx>, ctl: Arc<StreamCtl>,
+) {
+  let mut cancel = ctl.cancel.subscribe();
+  let pump = async {
+    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&backend))
+      .await.map_err(std::io::Error::other)??;
+    stream.set_nodelay(true)?;
+    {
+      let mut w = writer.lock().await;
+      write_frame(&mut *w, &Frame { frame_type: FrameType::RawReady, stream_id: id, flags: 0, payload: Bytes::new() }).await?;
+      w.flush().await?;
+    }
+    let (mut rd, mut wr) = stream.into_split();
+    let up = async {
+      let mut buf = vec![0; STREAM_CHUNK];
+      loop {
+        let n = rd.read(&mut buf).await?;
+        if n == 0 { send_data(&writer, id, flags::END_STREAM, Bytes::new()).await; break; }
+        send_paced(&writer, id, Some(&ctl), Bytes::copy_from_slice(&buf[..n])).await.map_err(std::io::Error::other)?;
+      }
+      Ok::<_, std::io::Error>(())
+    };
+    let down = async {
+      while let Some(bytes) = rx.recv().await {
+        match bytes {
+          Some(bytes) => {
+            wr.write_all(&bytes).await?;
+            let mut w = writer.lock().await;
+            write_frame(&mut *w, &Frame { frame_type: FrameType::WindowUpdate, stream_id: id, flags: 0,
+              payload: Bytes::copy_from_slice(&(bytes.len() as u32).to_be_bytes()) }).await?;
+            w.flush().await?;
+          }
+          None => { wr.shutdown().await?; break; }
+        }
+      }
+      Ok::<_, std::io::Error>(())
+    };
+    tokio::pin!(up, down);
+    tokio::select! {
+      result = &mut up => { result?; let _ = tokio::time::timeout(Duration::from_secs(5), &mut down).await; }
+      result = &mut down => { result?; let _ = tokio::time::timeout(Duration::from_secs(5), &mut up).await; }
+    }
+    Ok::<_, std::io::Error>(())
+  };
+  let failed = tokio::select! {
+    _ = cancelled(&mut cancel) => false,
+    result = pump => { if let Err(e) = result { debug!("Raw TLS stream {} closed: {}", id, e); true } else { false } }
+  };
+  ctl.abort();
+  senders.lock().await.remove(&id);
+  ctx.streams.lock().await.remove(&id);
+  if failed { send_reset(&writer, id, reset_codes::BACKEND_UNREACHABLE).await; }
+}
+
+fn validate_tls_modes(config: &ConfigPayload, flags: u8, required: &HashMap<u16, (String, String)>) -> Result<(), String> {
+  for domain in &config.domains {
+    if domain.flags & !0x07 != 0 { return Err("Unsupported domain flags".into()); }
+    if domain.flags & 0x04 != 0 && flags & 0x03 != 0x03 {
+      return Err("Server does not support flow-controlled TLS passthrough".into());
+    }
+  }
+  for (id, (name, local)) in required {
+    if !config.domains.iter().any(|d| d.domain_id == *id && d.flags & 0x04 != 0 &&
+        d.domain.to_ascii_lowercase() == *name && d.local_host == *local) {
+      return Err(format!("Server did not preserve required TLS passthrough mapping {}", name));
+    }
+  }
+  Ok(())
 }
 
 // ─── Per-stream handler ───────────────────────────────────────────────────────
@@ -1806,5 +1956,23 @@ mod streaming_tests {
 
   async fn rig_204() -> Rig {
     rig(|mut sock| async move { sock.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap(); }).await
+  }
+}
+
+#[cfg(test)]
+mod tls_mode_tests {
+  use super::*;
+  fn config(flags: u8) -> ConfigPayload {
+    ConfigPayload { domains: vec![DomainEntry { domain_id: 2, flags,
+      domain: "private.example.com".into(), local_host: "localhost:8443".into() }] }
+  }
+  #[test]
+  fn required_passthrough_cannot_be_downgraded_by_an_old_server() {
+    let expected = HashMap::from([(2, ("private.example.com".into(), "localhost:8443".into()))]);
+    assert!(validate_tls_modes(&config(0), 1, &expected).is_err());
+    assert!(validate_tls_modes(&config(4), 1, &expected).is_err());
+    assert!(validate_tls_modes(&config(4), 3, &expected).is_ok());
+    assert!(validate_tls_modes(&config(0), 1, &HashMap::new()).is_ok());
+    assert!(validate_tls_modes(&config(0x80), 3, &HashMap::new()).is_err());
   }
 }

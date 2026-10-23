@@ -187,7 +187,7 @@ In the dashboard, open **Client Tunnels**, click **Domains** on the tunnel's row
 | A DSM app on its own port (e.g. Synology Photos) | `localhost:<HTTP port>` | Control Panel → Login Portal → Applications → edit the app → set an **HTTP** port. |
 | Container (Container Manager) | `localhost:<host port>` | e.g. `localhost:8096` (Jellyfin), `localhost:8123` (Home Assistant). |
 
-Always map an HTTP port. tunnel-client talks plain HTTP to the NAS, and the proxy's Let's Encrypt certificate already gives visitors HTTPS. The NAS LAN IP (e.g. `192.168.0.79:5000`) works too, but `localhost` keeps working if the NAS gets a new IP.
+For the default **Proxy HTTPS** mode, map an HTTP port. tunnel-client talks plain HTTP to the NAS, and the proxy's Let's Encrypt certificate already gives visitors HTTPS. The NAS LAN IP (e.g. `192.168.0.79:5000`) works too, but `localhost` keeps working if the NAS gets a new IP.
 
 Mapping changes reach the running package within 5 minutes. To apply them immediately, Stop and Run the package in Package Center.
 
@@ -299,7 +299,7 @@ reusing it was a possible cause of missing updates in Package Center.
 
 ```bash
 # bin/ contains tunnel-client-linux-amd64, -arm64 and -armv7.
-packaging/synology/build-spk.sh 1.1.1 bin dist
+packaging/synology/build-spk.sh 1.2.0 bin dist
 ```
 
 For a rebuild of the same feature version, set `SPK_BUILD` explicitly to a
@@ -316,3 +316,20 @@ Uses the clientproxy.io tunnel protocol v2 — a binary multiplexed framing prot
 ## License
 
 MIT
+
+## TLS mode per domain
+
+Select **Proxy HTTPS** or **TLS passthrough** on each domain mapping in the ClientProxy dashboard.
+Existing mappings default to Proxy HTTPS and continue forwarding HTTP to the configured backend.
+A single tunnel can carry both kinds of mapping on the proxy's shared HTTPS port.
+
+For passthrough, set the local target to an existing **TLS listener**, for example `localhost:8443`,
+with a certificate for the public hostname. The client carries the original browser TLS bytes to
+that listener; the site private key stays local. It does not create, download or renew site
+certificates itself. Proxy HTTPS certificate options and cache features do not apply to passthrough.
+
+Upgrade the coordinator, proxy and client before selecting passthrough. Required passthrough
+mappings are checked against server CONFIG so an old server cannot silently turn them into HTTP
+forwarding. Passthrough requires a TLS-capable product without HTTP request quotas, and HTTP/3 must
+be disabled on the proxy. Byte limits still apply. Missing SNI and unavailable local TLS endpoints
+fail closed. No new CLI flag is required; the coordinator supplies the per-domain setting.

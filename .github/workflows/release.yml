@@ -15,9 +15,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    name: Test client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ inputs.version || github.ref_name }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as f:
+              version = tomllib.load(f)['package']['version']
+          assert os.environ['RELEASE_TAG'] == 'v' + version, 'Tag must match Cargo.toml'
+          PYTHON
+      - run: cargo test --locked
+      - run: python3 packaging/synology/test-build-spk.py
+
   # ── Build Linux musl binaries ─────────────────────────────────────
   build:
     name: Build (${{ matrix.arch }})
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -66,6 +86,7 @@ jobs:
   # ── Build Windows binary ──────────────────────────────────────────
   build-windows:
     name: Build (windows-amd64)
+    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -353,6 +374,9 @@ jobs:
           (cd windows-package && zip -q -r "../release/tunnel-client-windows-${VER}.zip" .)
           ls -lh release/
 
+      - name: Generate checksums
+        run: (cd release && sha256sum * > SHA256SUMS)
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -363,7 +387,8 @@ jobs:
           # unpublished. The tag is the deliberate act; treat it as the go-ahead.
           draft: false
           make_latest: true
-          generate_release_notes: true
+          body_path: docs/releases/1.2.0.md
+          fail_on_unmatched_files: true
           files: release/*
 
   # ── Check whether GCP credentials are available ──────────────────
