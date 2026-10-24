@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag (e.g. v0.9.3)"
+        description: "Existing source tag matching Cargo.toml (e.g. v1.2.0)"
         required: false
         type: string
 
@@ -24,12 +24,16 @@ jobs:
       - name: Validate release version
         env:
           RELEASE_TAG: ${{ inputs.version || github.ref_name }}
+          SOURCE_REF: ${{ github.ref }}
         run: |
           python3 - <<'PYTHON'
           import os, tomllib
+          from pathlib import Path
           with open('Cargo.toml', 'rb') as f:
               version = tomllib.load(f)['package']['version']
           assert os.environ['RELEASE_TAG'] == 'v' + version, 'Tag must match Cargo.toml'
+          assert os.environ['SOURCE_REF'] == 'refs/tags/v' + version, 'Release must run from its source tag, not a branch'
+          assert Path(f'docs/releases/{version}.md').is_file(), 'Add versioned release notes before tagging'
           PYTHON
       - run: cargo test --locked
       - run: python3 packaging/synology/test-build-spk.py
@@ -323,7 +327,7 @@ jobs:
   # ── Create GitHub Release ─────────────────────────────────────────
   release:
     name: GitHub Release
-    needs: [package, package-synology, build-windows]
+    needs: [package, package-synology, build-windows, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -360,9 +364,9 @@ jobs:
           mkdir -p release
           VER=${{ steps.ver.outputs.num }}
           # Linux raw binaries
-          mv binaries/binary-amd64/tunnel-client   release/tunnel-client-linux-amd64  2>/dev/null || true
-          mv binaries/binary-arm64/tunnel-client   release/tunnel-client-linux-arm64  2>/dev/null || true
-          mv binaries/binary-armv7/tunnel-client   release/tunnel-client-linux-armv7  2>/dev/null || true
+          install -m 0755 binaries/binary-amd64/tunnel-client release/tunnel-client-linux-amd64
+          install -m 0755 binaries/binary-arm64/tunnel-client release/tunnel-client-linux-arm64
+          install -m 0755 binaries/binary-armv7/tunnel-client release/tunnel-client-linux-armv7
           # Windows installer zip, including service wrapper and configuration migration.
           mkdir -p windows-package
           cp binaries/binary-windows-amd64/tunnel-client.exe windows-package/
@@ -387,81 +391,6 @@ jobs:
           # unpublished. The tag is the deliberate act; treat it as the go-ahead.
           draft: false
           make_latest: true
-          body_path: docs/releases/1.2.0.md
+          body_path: docs/releases/${{ steps.ver.outputs.num }}.md
           fail_on_unmatched_files: true
           files: release/*
-
-  # ── Check whether GCP credentials are available ──────────────────
-  check-gcp:
-    name: Check GCP credentials
-    needs: package
-    runs-on: ubuntu-latest
-    outputs:
-      has-key: ${{ steps.check.outputs.has-key }}
-    steps:
-      - id: check
-        env:
-          KEY: ${{ secrets.GCP_SA_KEY }}
-        run: |
-          if [ -n "$KEY" ]; then
-            echo "has-key=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has-key=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  # ── Publish to Google Artifact Registry ──────────────────────────
-  publish-gar:
-    name: Publish to Google Artifact Registry
-    needs: [package, check-gcp]
-    runs-on: ubuntu-latest
-    if: needs.check-gcp.outputs.has-key == 'true'
-    env:
-      PROJECT: proxyconfig-71f70
-      LOCATION: us-central1
-    steps:
-      - name: Get version
-        id: ver
-        run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            TAG="${{ github.event.inputs.version }}"
-          else
-            TAG="${{ github.ref_name }}"
-          fi
-          echo "num=${TAG#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Download packages
-        uses: actions/download-artifact@v4
-        with:
-          pattern: packages-*
-          merge-multiple: true
-          path: pkgs/
-
-      - name: Push .deb packages
-        run: |
-          VER=${{ steps.ver.outputs.num }}
-          for arch in amd64 arm64; do
-            DEB="pkgs/tunnel-client_${VER}_${arch}.deb"
-            echo "Uploading ${DEB}..."
-            gcloud artifacts apt upload tunnel-client-apt \
-              --location="$LOCATION" \
-              --source="$DEB"
-          done
-
-      - name: Push .rpm packages
-        run: |
-          VER=${{ steps.ver.outputs.num }}
-          for arch in amd64 arm64; do
-            RPM="pkgs/tunnel-client-${VER}-1.${arch}.rpm"
-            echo "Uploading ${RPM}..."
-            gcloud artifacts yum upload tunnel-client-yum \
-              --location="$LOCATION" \
-              --source="$RPM"
-          done

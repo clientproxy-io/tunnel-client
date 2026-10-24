@@ -263,10 +263,18 @@ docker logs -f tunnel-client                                 # Docker
 
 ---
 
+## Publishing
+
+Official client releases are built and published by the [GitHub tag workflow](.github/workflows/release.yml).
+Follow [docs/releasing.md](docs/releasing.md): update version, lockfile and versioned notes, test,
+commit/push, then push `v<version>`. GitHub builds the platform binaries, packages, Docker image and
+Synology feed. Local builds below are for development/testing; the private server is released
+separately from its local build script to Google APT/YUM.
+
 ## Build from source
 
 ```bash
-cargo build --bin tunnel-client --release
+cargo build --locked --bin tunnel-client --release
 ```
 
 **Cross-compile for Linux musl (Apple Silicon):**
@@ -274,7 +282,7 @@ cargo build --bin tunnel-client --release
 ```bash
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc \
 CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
-cargo build --bin tunnel-client --target x86_64-unknown-linux-musl --release
+cargo build --locked --bin tunnel-client --target x86_64-unknown-linux-musl --release
 ```
 
 **Cross-compile for Windows:**
@@ -282,7 +290,9 @@ cargo build --bin tunnel-client --target x86_64-unknown-linux-musl --release
 ```bash
 brew install mingw-w64
 rustup target add x86_64-pc-windows-gnu
-./scripts/build-windows.sh
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+cargo build --locked --bin tunnel-client --target x86_64-pc-windows-gnu --release
 ```
 
 ### Synology package releases
