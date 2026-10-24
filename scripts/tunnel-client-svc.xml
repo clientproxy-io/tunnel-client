@@ -1,4 +1,5 @@
 <service>
+  <env name="CLIENTPROXY_INSTALL_METHOD" value="windows-service"/>
   <id>tunnel-client</id>
   <name>clientproxy.io Tunnel Client</name>
   <description>Exposes local backends through the clientproxy.io reverse proxy tunnel.</description>

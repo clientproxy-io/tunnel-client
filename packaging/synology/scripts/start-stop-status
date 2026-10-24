@@ -23,6 +23,7 @@ start() {
     set -a
     . "$ENV_FILE"
     set +a
+    export CLIENTPROXY_INSTALL_METHOD=synology
     "$PKG_DEST/bin/tunnel-client" < /dev/null >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
   )

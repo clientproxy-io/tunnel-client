@@ -1,3 +1,4 @@
+mod runtime;
 /// Tunnel Client v2
 ///
 /// Connects to a tunnel server using protocol v2 (multiplexed binary framing).
@@ -606,6 +607,7 @@ where
     config.domains.iter().filter(|d| d.flags & 0x04 == 0).map(|d| { info!("  domain_id={} → {}", d.domain_id, d.local_host); (d.domain_id, d.local_host.clone()) }).collect()
   );
   info!("CONFIG received: {} domain mappings", domain_map.len());
+  let _runtime_reporter = runtime::start_reporter(args.api_url.clone(), args.tunnel_id.clone(), args.api_key.clone());
 
   // ── Body accumulator: stream_id → body_tx ─────────────────────────────────
   // Streams waiting for body DATA frames before their handler can run.

@@ -13,7 +13,7 @@
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
@@ -22,6 +22,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Static musl binary with bundled root CAs — nothing else is needed at runtime.
 FROM scratch
+ENV CLIENTPROXY_INSTALL_METHOD=docker
 COPY --from=build /tunnel-client /tunnel-client
 USER 65534:65534
 ENTRYPOINT ["/tunnel-client"]

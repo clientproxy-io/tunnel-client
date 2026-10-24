@@ -183,6 +183,8 @@ jobs:
           cp bin/tunnel-client               pkg/usr/local/bin/
           cp scripts/tunnel-client.service   pkg/lib/systemd/system/
 
+          mkdir -p pkg/usr/share/clientproxy
+          echo deb > pkg/usr/share/clientproxy/tunnel-client-install-method
           # .deb
           fpm -s dir -t deb \
             -n tunnel-client -v "$VER" \
@@ -195,8 +197,10 @@ jobs:
             -p "tunnel-client_${VER}_${ARCH}.deb" \
             -C pkg \
             usr/local/bin/tunnel-client \
-            lib/systemd/system/tunnel-client.service
+            lib/systemd/system/tunnel-client.service \
+            usr/share/clientproxy/tunnel-client-install-method
 
+          echo rpm > pkg/usr/share/clientproxy/tunnel-client-install-method
           # .rpm  (fpm maps amd64 → x86_64, arm64 → aarch64 automatically)
           fpm -s dir -t rpm \
             -n tunnel-client -v "$VER" \
@@ -209,7 +213,8 @@ jobs:
             -p "tunnel-client-${VER}-1.${ARCH}.rpm" \
             -C pkg \
             usr/local/bin/tunnel-client \
-            lib/systemd/system/tunnel-client.service
+            lib/systemd/system/tunnel-client.service \
+            usr/share/clientproxy/tunnel-client-install-method
 
           ls -lh *.deb *.rpm
 

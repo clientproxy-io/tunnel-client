@@ -22,3 +22,9 @@ python3 packaging/synology/test-build-spk.py
 ```
 
 The server repository's `scripts/e2e_tls_modes.py` tests both clients and server together against local HTTP/TLS backends. Passthrough requires server 0.11.0/client 1.2.0, an upgraded coordinator, a TLS-capable product without HTTP request quotas, HTTP/3 disabled, and an existing local TLS listener/certificate. Site certificate generation/renewal is not part of this client.
+
+## Runtime inventory (prepared for 1.3.0)
+
+After a valid CONFIG, the client reports version, OS, architecture, Cargo target and installation method once to the authenticated `/runtime/client-tunnels/:id` coordinator endpoint. Each reconnect sends a new report; there is no periodic reporting or automatic retry. The stored version/platform remain available after disconnect. Reports are best effort with an eight-second timeout and do not change the tunnel protocol or require an enterprise plan for subscription API keys. No credentials or hostnames are included in the payload. `CLIENTPROXY_INSTALL_METHOD` overrides detection (`deb`, `rpm`, `docker`, `synology`, `windows-service`, `binary`, `unknown`); official packages set markers/environment. Older Windows service XML can be updated with the environment entry from the new template while preserving credentials.
+
+The coordinator Software column compares public GitHub stable releases and offers platform-specific update instructions. Deploy coordinator/rules/frontend before releasing upgraded binaries. This change is not included in existing 1.2.0 artifacts; version 1.3.0 and its release notes are prepared; push the matching tag only when publishing is requested.

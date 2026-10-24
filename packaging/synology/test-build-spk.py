@@ -32,7 +32,7 @@ class SynologyPackageTest(unittest.TestCase):
         return result, output
 
     def test_release_build_increases_and_manifest_matches_package(self):
-        versions = ("1.0.6", "1.1.0", "1.1.1", "1.1.2", "1.2.0", "2.0.0")
+        versions = ("1.0.6", "1.1.0", "1.1.1", "1.1.2", "1.2.0", "1.3.0", "2.0.0")
         previous_build = 1  # Published packages previously reused build 0001.
         for version in versions:
             with self.subTest(version=version):
